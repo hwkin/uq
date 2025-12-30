@@ -329,7 +329,7 @@ def uqevaluation(num_test, test_data, model, data, method, hmcsamples=None, lasa
                 unpack_params(model, s.to(device))
                 x_tensor = torch.from_numpy(x_eval).float().to(device) if isinstance(x_eval, np.ndarray) else x_eval.to(device)
                 pred = model.predict(x_tensor)
-                preds_eval_list.append(data.decoder_Y(pred.cpu().numpy()))
+                preds_eval_list.append(pred.cpu().numpy())
         preds_eval = np.stack(preds_eval_list)  # [n_posterior, n_eval, n_outputs]
     elif method == 'mcd':
         preds_eval_list = []
@@ -338,7 +338,7 @@ def uqevaluation(num_test, test_data, model, data, method, hmcsamples=None, lasa
                 x_tensor = torch.from_numpy(x_eval).float().to(device)
                 # Use forward() instead of predict() to keep dropout active
                 pred = model.forward(x_tensor)
-                preds_eval_list.append(data.decoder_Y(pred.cpu().numpy()))
+                preds_eval_list.append(pred.cpu().numpy())
         preds_eval = np.stack(preds_eval_list)  # [n_eval, n_outputs]
     elif method == 'la':
         preds_eval_list = []
@@ -347,11 +347,9 @@ def uqevaluation(num_test, test_data, model, data, method, hmcsamples=None, lasa
                 unpack_params(model, s.to(device))
                 x_tensor = torch.from_numpy(x_eval).float().to(device) if isinstance(x_eval, np.ndarray) else x_eval.to(device)
                 pred = model.predict(x_tensor)
-                preds_eval_list.append(data.decoder_Y(pred.cpu().numpy()))
+                preds_eval_list.append(pred.cpu().numpy())
         preds_eval = np.stack(preds_eval_list)  # [num_samples, num_eval, num_outputs]
-    
-    x_eval = data.decoder_X(x_eval)
-    y_eval = data.decoder_Y(y_eval)
+
     # Compute uncertainties
     mean_pred_eval = preds_eval.mean(axis=0)
     epistemic_var_eval = preds_eval.var(axis=0)
@@ -359,100 +357,35 @@ def uqevaluation(num_test, test_data, model, data, method, hmcsamples=None, lasa
     aleatoric_var_eval = noise_std ** 2
     total_var_eval = epistemic_var_eval + aleatoric_var_eval
     total_std_eval = np.sqrt(total_var_eval)
+    sample_std = np.std(preds_eval, axis=1)
 
     # ============================================================
     # Uncertainty Quality Metrics
     # ============================================================
-    print("\n" + "="*60)
-    print("Uncertainty Quality Metrics")
-    print("="*60)
 
-    # 1. PREDICTION ERROR
+    # PREDICTION ERROR
     errors = y_eval - mean_pred_eval
     abs_errors = np.abs(errors)
     squared_errors = errors ** 2
 
     rmse = np.sqrt(np.mean(squared_errors))
-    mae = np.mean(abs_errors)
-    rel_l2_errors = np.linalg.norm(errors, axis=1) / np.linalg.norm(y_eval, axis=1)
 
-    print(f"\n1. PREDICTION ACCURACY:")
-    print(f"   RMSE: {rmse:.6f}")
-    print(f"   MAE:  {mae:.6f}")
-    print(f"   Mean Relative L2 Error: {np.mean(rel_l2_errors)*100:.2f}%")
-    print(f"   Std Relative L2 Error:  {np.std(rel_l2_errors)*100:.2f}%")
-
-    # 2. CALIBRATION - Check if uncertainties are well-calibrated
-    # For a well-calibrated model: |error| / σ_total should follow N(0,1)
-    # So ~68% should be within 1σ, ~95% within 2σ, ~99.7% within 3σ
+    # CALIBRATION - Check if uncertainties are well-calibrated
     z_scores = np.abs(errors) / total_std_eval
 
     coverage_1sigma = np.mean(z_scores <= 1.0)  # Should be ~68.3%
     coverage_2sigma = np.mean(z_scores <= 2.0)  # Should be ~95.4%
     coverage_3sigma = np.mean(z_scores <= 3.0)  # Should be ~99.7%
 
-    print(f"\n2. CALIBRATION (Coverage Analysis):")
-    print(f"   Coverage within 1σ: {coverage_1sigma*100:.1f}% (ideal: 68.3%)")
-    print(f"   Coverage within 2σ: {coverage_2sigma*100:.1f}% (ideal: 95.4%)")
-    print(f"   Coverage within 3σ: {coverage_3sigma*100:.1f}% (ideal: 99.7%)")
+    # SHARPNESS - How tight are the uncertainty bounds?
+    num_sigma = 2.0
+    widths = 2 * num_sigma * total_std_eval
+    mpiw = np.mean(widths)
 
-    # Calibration quality indicator
-    if coverage_2sigma > 0.99:
-        calib_status = "OVER-CONFIDENT (uncertainties too small)"
-    elif coverage_2sigma < 0.90:
-        calib_status = "UNDER-CONFIDENT (uncertainties too large)"
-    else:
-        calib_status = "WELL-CALIBRATED"
-    print(f"   Status: {calib_status}")
-
-    # 3. SHARPNESS - How tight are the uncertainty bounds?
-    mean_epistemic = epistemic_std_eval.mean()
-    mean_total = total_std_eval.mean()
-
-    print(f"\n3. SHARPNESS (Uncertainty Magnitude):")
-    print(f"   Mean Epistemic σ: {mean_epistemic:.6f}")
-    print(f"   Mean Total σ:     {mean_total:.6f}")
-    print(f"   Mean Aleatoric σ: {np.sqrt(aleatoric_var_eval):.6f} (fixed)")
-
-    # 4. UNCERTAINTY-ERROR CORRELATION
-    # Good uncertainty should correlate with actual errors
-    per_sample_epistemic = epistemic_std_eval.mean(axis=1)  # Mean uncertainty per sample
-    per_sample_error = abs_errors.mean(axis=1)  # Mean error per sample
-
-    correlation = np.corrcoef(per_sample_epistemic, per_sample_error)[0, 1]
-
-    print(f"\n4. UNCERTAINTY-ERROR CORRELATION:")
-    print(f"   Pearson correlation: {correlation:.3f}")
-    if correlation > 0.5:
-        print(f"   → Good! High uncertainty correlates with high error")
-    elif correlation > 0.2:
-        print(f"   → Moderate correlation")
-    else:
-        print(f"   → Weak correlation - uncertainty may not be informative")
-
-    # 5. EPISTEMIC vs ALEATORIC DECOMPOSITION
-    epistemic_fraction = epistemic_var_eval / (total_var_eval + 1e-10)
-    mean_epistemic_fraction = epistemic_fraction.mean()
-
-    print(f"\n5. UNCERTAINTY DECOMPOSITION:")
-    print(f"   Epistemic fraction: {mean_epistemic_fraction*100:.1f}%")
-    print(f"   Aleatoric fraction: {(1-mean_epistemic_fraction)*100:.1f}%")
-    if mean_epistemic_fraction > 0.8:
-        print(f"   → Model uncertainty dominates (more data may help)")
-    elif mean_epistemic_fraction < 0.2:
-        print(f"   → Data noise dominates (model is confident)")
-    else:
-        print(f"   → Balanced uncertainty sources")
-
-    # 6. NEGATIVE LOG-LIKELIHOOD (proper scoring rule)
+    # NEGATIVE LOG-LIKELIHOOD (proper scoring rule)
     nll = 0.5 * np.mean(np.log(2 * np.pi * total_var_eval) + squared_errors / total_var_eval)
-    print(f"\n6. PROPER SCORING RULES:")
-    print(f"   Negative Log-Likelihood: {nll:.4f}")
-    print(f"   (Lower is better)")
 
-    print("\n" + "="*60)
-
-    return total_std_eval,[rmse, mae, rel_l2_errors, coverage_1sigma, coverage_2sigma, coverage_3sigma, mean_epistemic, mean_total, mean_epistemic_fraction ,correlation, nll]
+    return sample_std, [rmse, coverage_1sigma, coverage_2sigma, coverage_3sigma, mpiw, nll, np.mean(total_std_eval)]
 
 def comparison_uq(result1,result2,result3):
     print("="*70)
@@ -462,67 +395,42 @@ def comparison_uq(result1,result2,result3):
     comparison_data = {
         'Metric': [
             'RMSE', 
-            'MAE', 
-            'Mean Rel. L2 Error (%)',
             'Coverage 1σ (%)',
             'Coverage 2σ (%)',
             'Coverage 3σ (%)',
-            'Mean Epistemic σ',
-            'Mean Total σ',
-            'Epistemic Fraction (%)',
-            'Uncertainty-Error Corr.',
+            'MPIW',
             'NLL'
         ],
         'HMC': [
             f'{result1[0]:.6f}',
-            f'{result1[1]:.6f}',
-            f'{np.mean(result1[2])*100:.2f}',
+            f'{result1[1]*100:.1f}',
+            f'{result1[2]*100:.1f}',
             f'{result1[3]*100:.1f}',
-            f'{result1[4]*100:.1f}',
-            f'{result1[5]*100:.1f}',
-            f'{result1[6]:.6f}',
-            f'{result1[7]:.6f}',
-            f'{result1[8]*100:.1f}',
-            f'{result1[9]:.3f}',
-            f'{result1[10]:.4f}'
+            f'{result1[4]:.4f}',
+            f'{result1[5]:.4f}'
         ],
         'MC Dropout': [
             f'{result2[0]:.6f}',
-            f'{result2[1]:.6f}',
-            f'{np.mean(result2[2])*100:.2f}',
+            f'{result2[1]*100:.1f}',
+            f'{result2[2]*100:.1f}',
             f'{result2[3]*100:.1f}',
-            f'{result2[4]*100:.1f}',
-            f'{result2[5]*100:.1f}',
-            f'{result2[6]:.6f}',
-            f'{result2[7]:.6f}',
-            f'{result2[8]*100:.1f}',
-            f'{result2[9]:.3f}',
-            f'{result2[10]:.4f}'
+            f'{result2[4]:.4f}',
+            f'{result2[5]:.4f}'
         ],
         'Laplace': [
             f'{result3[0]:.6f}',
-            f'{result3[1]:.6f}',
-            f'{np.mean(result3[2])*100:.2f}',
+            f'{result3[1]*100:.1f}',
+            f'{result3[2]*100:.1f}',
             f'{result3[3]*100:.1f}',
-            f'{result3[4]*100:.1f}',
-            f'{result3[5]*100:.1f}',
-            f'{result3[6]:.6f}',
-            f'{result3[7]:.6f}',
-            f'{result3[8]*100:.1f}',
-            f'{result3[9]:.3f}',
-            f'{result3[10]:.4f}'
+            f'{result3[4]:.4f}',
+            f'{result3[5]:.4f}'
         ],
         'Ideal': [
-            'Lower',
-            'Lower',
             'Lower',
             '68.3',
             '95.4',
             '99.7',
-            '-',
-            '-',
-            '-',
-            'Higher',
+            'Lower',
             'Lower'
         ]
     }
@@ -538,62 +446,6 @@ def comparison_uq(result1,result2,result3):
             comparison_data['Laplace'][i],
             comparison_data['Ideal'][i]
         ))
-
-    # Create a bar chart comparison
-    fig_comp, axes_comp = plt.subplots(2, 3, figsize=(15, 8))
-
-    methods = ['HMC', 'MC Dropout', 'Laplace']
-    colors = ['#2ecc71', '#3498db', '#e74c3c']
-
-    # Plot 1: Calibration (2σ coverage)
-    ax = axes_comp[0, 0]
-    coverages = [result1[4]*100, result2[4]*100, result3[4]*100]
-    bars = ax.bar(methods, coverages, color=colors)
-    ax.axhline(y=95.4, color='black', linestyle='--', linewidth=2, label='Ideal (95.4%)')
-    ax.set_ylabel('Coverage (%)', fontsize=12)
-    ax.set_title('2σ Coverage (Calibration)', fontsize=14)
-    ax.set_ylim([0, 105])
-    ax.legend()
-
-    # Plot 2: Mean Epistemic σ
-    ax = axes_comp[0, 1]
-    epistemic_sigmas = [result1[6], result2[6], result3[6]]
-    ax.bar(methods, epistemic_sigmas, color=colors)
-    ax.set_ylabel('Mean σ_epistemic', fontsize=12)
-    ax.set_title('Epistemic Uncertainty', fontsize=14)
-
-    # Plot 3: Uncertainty-Error Correlation
-    ax = axes_comp[0, 2]
-    correlations = [result1[9], result2[9], result3[9]]
-    ax.bar(methods, correlations, color=colors)
-    ax.set_ylabel('Pearson Correlation', fontsize=12)
-    ax.set_title('Uncertainty-Error Correlation', fontsize=14)
-    ax.set_ylim([0, 1])
-
-    # Plot 4: NLL
-    ax = axes_comp[1, 0]
-    nlls = [result1[10], result2[10], result3[10]]
-    ax.bar(methods, nlls, color=colors)
-    ax.set_ylabel('NLL', fontsize=12)
-    ax.set_title('Negative Log-Likelihood (Lower is Better)', fontsize=14)
-
-    # Plot 5: Epistemic Fraction
-    ax = axes_comp[1, 1]
-    epi_fracs = [result1[8]*100, result2[8]*100, result3[8]*100]
-    ax.bar(methods, epi_fracs, color=colors)
-    ax.set_ylabel('Epistemic Fraction (%)', fontsize=12)
-    ax.set_title('Epistemic vs Total Uncertainty', fontsize=14)
-
-    # Plot 6: Mean Relative L2 Error
-    ax = axes_comp[1, 2]
-    rel_errors = [np.mean(result1[2])*100, np.mean(result2[2])*100, np.mean(result3[2])*100]
-    ax.bar(methods, rel_errors, color=colors)
-    ax.set_ylabel('Mean Rel. L2 Error (%)', fontsize=12)
-    ax.set_title('Prediction Accuracy', fontsize=14)
-
-    fig_comp.tight_layout()
-    fig_comp.suptitle('Comparison of Uncertainty Quantification Methods', fontsize=16, y=1.02)
-    plt.show()
 
 def plot_uq(num_test, test_data, model, data, method, hmcsamples=None, lasamples=None):
     # Define visualization parameters
@@ -705,4 +557,36 @@ def plot_uq(num_test, test_data, model, data, method, hmcsamples=None, lasamples
             axs[i,j].axis('off')
 
     fig.tight_layout()
+    plt.show()
+
+def run_regression_shift(method, levels, results):
+    stats = {m: {'rmse': [], 'nll': [], 'unc': [], 'cov': []} for m in method}
+
+    for method, result in zip(method, results):
+        for i, lvl in enumerate(levels):
+            stats[method]['rmse'].append(result[i][0])
+            stats[method]['nll'].append(result[i][-2])
+            stats[method]['unc'].append(result[i][-1])
+            stats[method]['cov'].append(result[i][2])
+
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
+    
+    metrics = ['rmse', 'nll', 'unc', 'cov']
+    titles = ['RMSE (Error) (↓)', 'NLL (↓)', 'Uncertainty (Avg Std) (↑)', '95% Coverage (Target: 0.95)']
+    
+    for i, metric in enumerate(metrics):
+        ax = axes[i]
+        for method, data in stats.items():
+            ax.plot(levels, data[metric], marker='o', label=method)
+            
+        # Draw target line for coverage
+        if metric == 'cov':
+            ax.axhline(0.95, color='black', linestyle='--', label='Ideal')
+            
+        ax.set_title(titles[i])
+        ax.set_xlabel('Shift Intensity')
+        ax.grid(True, alpha=0.3)
+        if i == 0: ax.legend()
+        
+    plt.tight_layout()
     plt.show()

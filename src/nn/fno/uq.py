@@ -593,7 +593,7 @@ def hmc_adaptive(
     return torch.stack(samples), final_accept_rate, step_size, step_size_history
 
 
-def inject_dropout(model, target_layer_type=nn.Linear, dropout_rate=0.5):
+def inject_dropout(model, target_layer_type=nn.Linear, dropout_rate=0.1):
     """
     Recursively adds a Dropout layer after every occurrence of `target_layer_type`.
     For FNO models, also handles FNO2DLayer and Conv2d layers.
@@ -915,16 +915,6 @@ def uqevaluation(test_data, model, data, method, hmc_samples=None, sgld_samples=
     squared_errors = errors ** 2
 
     rmse = np.sqrt(np.mean(squared_errors))
-    mae = np.mean(abs_errors)
-    denom = np.linalg.norm(y_eval, axis=1)
-    denom = np.where(denom > 0.0, denom, 1.0)
-    rel_l2_errors = np.linalg.norm(errors, axis=1) / denom
-
-    print(f"\n1. PREDICTION ACCURACY:")
-    print(f"   RMSE: {rmse:.6f}")
-    print(f"   MAE:  {mae:.6f}")
-    print(f"   Mean Relative L2 Error: {np.mean(rel_l2_errors)*100:.2f}%")
-    print(f"   Std Relative L2 Error:  {np.std(rel_l2_errors)*100:.2f}%")
 
     # 2. CALIBRATION
     z_scores = np.abs(errors) / total_std_eval
@@ -933,63 +923,12 @@ def uqevaluation(test_data, model, data, method, hmc_samples=None, sgld_samples=
     coverage_2sigma = np.mean(z_scores <= 2.0)
     coverage_3sigma = np.mean(z_scores <= 3.0)
 
-    print(f"\n2. CALIBRATION (Coverage Analysis):")
-    print(f"   Coverage within 1σ: {coverage_1sigma*100:.1f}% (ideal: 68.3%)")
-    print(f"   Coverage within 2σ: {coverage_2sigma*100:.1f}% (ideal: 95.4%)")
-    print(f"   Coverage within 3σ: {coverage_3sigma*100:.1f}% (ideal: 99.7%)")
-
-    if coverage_2sigma > 0.99:
-        calib_status = "OVER-CONFIDENT (uncertainties too small)"
-    elif coverage_2sigma < 0.90:
-        calib_status = "UNDER-CONFIDENT (uncertainties too large)"
-    else:
-        calib_status = "WELL-CALIBRATED"
-    print(f"   Status: {calib_status}")
-
     # 3. SHARPNESS
-    mean_epistemic = epistemic_std_eval.mean()
-    mean_total = total_std_eval.mean()
+    num_sigma = 2.0
+    widths = 2 * num_sigma * total_std_eval
+    mpiw = np.mean(widths)
 
-    print(f"\n3. SHARPNESS (Uncertainty Magnitude):")
-    print(f"   Mean Epistemic σ: {mean_epistemic:.6f}")
-    print(f"   Mean Total σ:     {mean_total:.6f}")
-    print(f"   Mean Aleatoric σ: {np.sqrt(aleatoric_var_eval):.6f} (fixed)")
-
-    # 4. UNCERTAINTY-ERROR CORRELATION
-    per_sample_epistemic = epistemic_std_eval.mean(axis=1)
-    per_sample_error = abs_errors.mean(axis=1)
-
-    if np.std(per_sample_epistemic) == 0.0 or np.std(per_sample_error) == 0.0:
-        correlation = 0.0
-    else:
-        correlation = float(np.corrcoef(per_sample_epistemic, per_sample_error)[0, 1])
-        if not np.isfinite(correlation):
-            correlation = 0.0
-
-    print(f"\n4. UNCERTAINTY-ERROR CORRELATION:")
-    print(f"   Pearson correlation: {correlation:.3f}")
-    if correlation > 0.5:
-        print(f"   → Good! High uncertainty correlates with high error")
-    elif correlation > 0.2:
-        print(f"   → Moderate correlation")
-    else:
-        print(f"   → Weak correlation - uncertainty may not be informative")
-
-    # 5. EPISTEMIC vs ALEATORIC DECOMPOSITION
-    epistemic_fraction = epistemic_var_eval / (total_var_eval + 1e-10)
-    mean_epistemic_fraction = epistemic_fraction.mean()
-
-    print(f"\n5. UNCERTAINTY DECOMPOSITION:")
-    print(f"   Epistemic fraction: {mean_epistemic_fraction*100:.1f}%")
-    print(f"   Aleatoric fraction: {(1-mean_epistemic_fraction)*100:.1f}%")
-    if mean_epistemic_fraction > 0.8:
-        print(f"   → Model uncertainty dominates")
-    elif mean_epistemic_fraction < 0.2:
-        print(f"   → Data noise dominates (model is confident)")
-    else:
-        print(f"   → Balanced uncertainty sources")
-
-    # 6. NEGATIVE LOG-LIKELIHOOD
+    # 4. NEGATIVE LOG-LIKELIHOOD
     total_var_safe = np.maximum(total_var_eval, 1e-12)
     nll = 0.5 * np.mean(np.log(2 * np.pi * total_var_safe) + squared_errors / total_var_safe)
     print(f"\n6. PROPER SCORING RULES:")
@@ -1001,103 +940,64 @@ def uqevaluation(test_data, model, data, method, hmc_samples=None, sgld_samples=
     # Return metrics dict and computed values for compatibility
     metrics = {
         'RMSE': rmse,
-        'MAE': mae,
-        'Mean_Rel_L2_Error': np.mean(rel_l2_errors),
         'Coverage_1σ': coverage_1sigma * 100,
         'Coverage_2σ': coverage_2sigma * 100,
         'Coverage_3σ': coverage_3sigma * 100,
-        'Sharpness_Epistemic': mean_epistemic,
-        'Sharpness_Total': mean_total,
-        'Correlation': correlation,
-        'Epistemic_Fraction': mean_epistemic_fraction,
-        'NLL': nll
+        'MPIW': mpiw,
+        'NLL': nll,
+        'Uncertainty_Mean_Std': np.mean(total_std_eval)
     }
-    
-    # Reshape mean and std back to original shape for return
-    pred_mean = np.mean(predictions, axis=0)
-    pred_std = np.std(predictions, axis=0)
-    
-    return metrics, pred_mean, total_std_eval
+    return metrics, total_std_eval
 
 
 def comparison_plotting(hmc_metrics, sgld_metrics, mcd_metrics, la_metrics):
     comparison_data = {
         'Metric': [
             'RMSE', 
-            'MAE', 
-            'Mean Rel. L2 Error (%)',
             'Coverage 1σ (%)',
             'Coverage 2σ (%)',
             'Coverage 3σ (%)',
-            'Mean Epistemic σ',
-            'Mean Total σ',
-            'Epistemic Fraction (%)',
-            'Uncertainty-Error Corr.',
+            'MPIW'
             'NLL'
         ],
         'HMC': [
             f'{hmc_metrics["RMSE"]:.6f}',
-            f'{hmc_metrics["MAE"]:.6f}',
-            f'{hmc_metrics["Mean_Rel_L2_Error"]*100:.2f}',
             f'{hmc_metrics["Coverage_1σ"]:.1f}',
             f'{hmc_metrics["Coverage_2σ"]:.1f}',
             f'{hmc_metrics["Coverage_3σ"]:.1f}',
-            f'{hmc_metrics["Sharpness_Epistemic"]:.6f}',
-            f'{hmc_metrics["Sharpness_Total"]:.6f}',
-            f'{hmc_metrics["Epistemic_Fraction"]*100:.1f}',
-            f'{hmc_metrics["Correlation"]:.3f}',
+            f'{hmc_metrics["MPIW"]:.3f}',
             f'{hmc_metrics["NLL"]:.4f}'
         ],
         'SGLD': [
             f'{sgld_metrics["RMSE"]:.6f}',
-            f'{sgld_metrics["MAE"]:.6f}',
-            f'{sgld_metrics["Mean_Rel_L2_Error"]*100:.2f}',
             f'{sgld_metrics["Coverage_1σ"]:.1f}',
             f'{sgld_metrics["Coverage_2σ"]:.1f}',
             f'{sgld_metrics["Coverage_3σ"]:.1f}',
-            f'{sgld_metrics["Sharpness_Epistemic"]:.6f}',
-            f'{sgld_metrics["Sharpness_Total"]:.6f}',
-            f'{sgld_metrics["Epistemic_Fraction"]*100:.1f}',
-            f'{sgld_metrics["Correlation"]:.3f}',
+            f'{sgld_metrics["MPIW"]:.3f}',
             f'{sgld_metrics["NLL"]:.4f}'
         ],
         'MC Dropout': [
             f'{mcd_metrics["RMSE"]:.6f}',
-            f'{mcd_metrics["MAE"]:.6f}',
-            f'{mcd_metrics["Mean_Rel_L2_Error"]*100:.2f}',
             f'{mcd_metrics["Coverage_1σ"]:.1f}',
             f'{mcd_metrics["Coverage_2σ"]:.1f}',
             f'{mcd_metrics["Coverage_3σ"]:.1f}',
-            f'{mcd_metrics["Sharpness_Epistemic"]:.6f}',
-            f'{mcd_metrics["Sharpness_Total"]:.6f}',
-            f'{mcd_metrics["Epistemic_Fraction"]*100:.1f}',
-            f'{mcd_metrics["Correlation"]:.3f}',
+            f'{mcd_metrics["MPIW"]:.3f}',
             f'{mcd_metrics["NLL"]:.4f}'
         ],
         'Laplace': [
             f'{la_metrics["RMSE"]:.6f}',
-            f'{la_metrics["MAE"]:.6f}',
-            f'{la_metrics["Mean_Rel_L2_Error"]*100:.2f}',
             f'{la_metrics["Coverage_1σ"]:.1f}',
             f'{la_metrics["Coverage_2σ"]:.1f}',
             f'{la_metrics["Coverage_3σ"]:.1f}',
-            f'{la_metrics["Sharpness_Epistemic"]:.6f}',
-            f'{la_metrics["Sharpness_Total"]:.6f}',
-            f'{la_metrics["Epistemic_Fraction"]*100:.1f}',
-            f'{la_metrics["Correlation"]:.3f}',
+            f'{la_metrics["MPIW"]:.3f}',
             f'{la_metrics["NLL"]:.4f}'
         ],
         'Ideal': [
             'Lower',
-            'Lower',
-            'Lower',
             '68.3',
             '95.4',
             '99.7',
-            '-',
-            '-',
-            '-',
-            'Higher',
+            'Lower',
             'Lower'
         ]
     }
@@ -1114,69 +1014,35 @@ def comparison_plotting(hmc_metrics, sgld_metrics, mcd_metrics, la_metrics):
             comparison_data['Laplace'][i],
             comparison_data['Ideal'][i]
         ))
-    # Create a bar chart comparison
-    fig_comp, axes_comp = plt.subplots(2, 3, figsize=(15, 8))
 
-    methods = ['HMC', 'SGLD', 'MC Dropout', 'Laplace']
-    colors = ['#9b59b6', '#2ecc71', '#3498db', '#e74c3c']
+def run_regression_shift(method, levels, results):
+    stats = {m: {'rmse': [], 'nll': [], 'unc': [], 'cov': []} for m in method}
 
-    # Plot 1: Calibration (2σ coverage)
-    ax = axes_comp[0, 0]
-    coverages = [hmc_metrics['Coverage_2σ'], sgld_metrics['Coverage_2σ'], 
-                mcd_metrics['Coverage_2σ'], la_metrics['Coverage_2σ']]
-    bars = ax.bar(methods, coverages, color=colors)
-    ax.axhline(y=95.4, color='black', linestyle='--', linewidth=2, label='Ideal (95.4%)')
-    ax.set_ylabel('Coverage (%)', fontsize=12)
-    ax.set_title('2σ Coverage (Calibration)', fontsize=14)
-    ax.set_ylim([0, 105])
-    ax.legend()
-    ax.tick_params(axis='x', rotation=15)
+    for method, result in zip(method, results):
+        for i, lvl in enumerate(levels):
+            stats[method]['rmse'].append(result[i]['RMSE'])
+            stats[method]['nll'].append(result[i]['NLL'])
+            stats[method]['unc'].append(result[i]['Uncertainty_Mean_Std'])
+            stats[method]['cov'].append(result[i]['Coverage_2σ'] / 100.0)  # Convert to [0,1] range
 
-    # Plot 2: Mean Epistemic σ
-    ax = axes_comp[0, 1]
-    epistemic_sigmas = [hmc_metrics['Sharpness_Epistemic'], sgld_metrics['Sharpness_Epistemic'],
-                        mcd_metrics['Sharpness_Epistemic'], la_metrics['Sharpness_Epistemic']]
-    ax.bar(methods, epistemic_sigmas, color=colors)
-    ax.set_ylabel('Mean σ_epistemic', fontsize=12)
-    ax.set_title('Epistemic Uncertainty', fontsize=14)
-    ax.tick_params(axis='x', rotation=15)
-
-    # Plot 3: Uncertainty-Error Correlation
-    ax = axes_comp[0, 2]
-    correlations = [hmc_metrics['Correlation'], sgld_metrics['Correlation'],
-                    mcd_metrics['Correlation'], la_metrics['Correlation']]
-    ax.bar(methods, correlations, color=colors)
-    ax.set_ylabel('Pearson Correlation', fontsize=12)
-    ax.set_title('Uncertainty-Error Correlation', fontsize=14)
-    ax.set_ylim([0, 1])
-    ax.tick_params(axis='x', rotation=15)
-
-    # Plot 4: NLL
-    ax = axes_comp[1, 0]
-    nlls = [hmc_metrics['NLL'], sgld_metrics['NLL'], mcd_metrics['NLL'], la_metrics['NLL']]
-    ax.bar(methods, nlls, color=colors)
-    ax.set_ylabel('NLL', fontsize=12)
-    ax.set_title('Negative Log-Likelihood (Lower is Better)', fontsize=14)
-    ax.tick_params(axis='x', rotation=15)
-
-    # Plot 5: Epistemic Fraction
-    ax = axes_comp[1, 1]
-    epi_fracs = [hmc_metrics['Epistemic_Fraction']*100, sgld_metrics['Epistemic_Fraction']*100,
-                mcd_metrics['Epistemic_Fraction']*100, la_metrics['Epistemic_Fraction']*100]
-    ax.bar(methods, epi_fracs, color=colors)
-    ax.set_ylabel('Epistemic Fraction (%)', fontsize=12)
-    ax.set_title('Epistemic vs Total Uncertainty', fontsize=14)
-    ax.tick_params(axis='x', rotation=15)
-
-    # Plot 6: Mean Relative L2 Error
-    ax = axes_comp[1, 2]
-    rel_errors = [hmc_metrics['Mean_Rel_L2_Error']*100, sgld_metrics['Mean_Rel_L2_Error']*100,
-                mcd_metrics['Mean_Rel_L2_Error']*100, la_metrics['Mean_Rel_L2_Error']*100]
-    ax.bar(methods, rel_errors, color=colors)
-    ax.set_ylabel('Mean Rel. L2 Error (%)', fontsize=12)
-    ax.set_title('Prediction Accuracy', fontsize=14)
-    ax.tick_params(axis='x', rotation=15)
-
-    fig_comp.tight_layout()
-    fig_comp.suptitle('Comparison of Uncertainty Quantification Methods - FNO', fontsize=16, y=1.02)
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
+    
+    metrics = ['rmse', 'nll', 'unc', 'cov']
+    titles = ['RMSE (Error) (↓)', 'NLL (↓)', 'Uncertainty (Avg Std) (↑)', '95% Coverage (Target: 0.95)']
+    
+    for i, metric in enumerate(metrics):
+        ax = axes[i]
+        for method, data in stats.items():
+            ax.plot(levels, data[metric], marker='o', label=method)
+            
+        # Draw target line for coverage
+        if metric == 'cov':
+            ax.axhline(0.95, color='black', linestyle='--', label='Ideal')
+            
+        ax.set_title(titles[i])
+        ax.set_xlabel('Shift Intensity')
+        ax.grid(True, alpha=0.3)
+        if i == 0: ax.legend()
+        
+    plt.tight_layout()
     plt.show()
