@@ -8,7 +8,7 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 import sys
 src_path = "/../../"
 sys.path.append(src_path + 'plotting/')
-from field_plot import field_plot
+from field_plot import field_plot # pyright: ignore[reportMissingImports]
 
 # --- Utilities to flatten/unflatten model parameters ---
 def get_param_shapes(model):
@@ -194,7 +194,7 @@ def hmc_adaptive(log_prob_fn, initial, target_accept=0.75, initial_step_size=1e-
         
         # Collect samples after burn-in
         if i >= burn_in:
-            samples.append(current.detach().cpu())
+            samples.append(current.detach().clone())
         
         # Progress reporting
         if (i + 1) % 50 == 0:
@@ -307,25 +307,25 @@ def inject_dropout(model, target_layer_type=nn.Linear, dropout_rate=0.1):
         else:
             inject_dropout(child, target_layer_type, dropout_rate)
 
-def uqevaluation(num_test, test_data, model, data, method, hmcsamples=None, lasamples=None):
+def uqevaluation(num_test, test_data, model, method, hmc_samples=None, la_samples=None):
     # Define noise standard deviation (should match the value used in HMC sampling)
     noise_std = 0.05
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    num_eval_samples = min(200, num_test)  # Evaluate on 200 samples
-    eval_indices = np.random.choice(num_test, num_eval_samples, replace=False)
+    eval_indices = np.random.choice(len(test_data["X_train"]), num_test, replace=False)
+    eval_indices.sort()
     epoch_mcd = 100
 
     x_eval = test_data['X_train'][eval_indices]
     y_eval = test_data['Y_train'][eval_indices]
 
-    print(f"Evaluating uncertainty on {num_eval_samples} test samples...")
+    print(f"Evaluating uncertainty on {num_test} test samples...")
 
     if method == 'hmc':
         # Compute predictions for each posterior sample
         print("Computing posterior predictions...")
         with torch.no_grad():
             preds_eval_list = []
-            for idx, s in enumerate(hmcsamples):
+            for idx, s in enumerate(hmc_samples): # type: ignore
                 unpack_params(model, s.to(device))
                 x_tensor = torch.from_numpy(x_eval).float().to(device) if isinstance(x_eval, np.ndarray) else x_eval.to(device)
                 pred = model.predict(x_tensor)
@@ -343,7 +343,7 @@ def uqevaluation(num_test, test_data, model, data, method, hmcsamples=None, lasa
     elif method == 'la':
         preds_eval_list = []
         with torch.no_grad():
-            for idx, s in enumerate(lasamples):
+            for idx, s in enumerate(la_samples): # type: ignore
                 unpack_params(model, s.to(device))
                 x_tensor = torch.from_numpy(x_eval).float().to(device) if isinstance(x_eval, np.ndarray) else x_eval.to(device)
                 pred = model.predict(x_tensor)
@@ -357,11 +357,7 @@ def uqevaluation(num_test, test_data, model, data, method, hmcsamples=None, lasa
     aleatoric_var_eval = noise_std ** 2
     total_var_eval = epistemic_var_eval + aleatoric_var_eval
     total_std_eval = np.sqrt(total_var_eval)
-    sample_std = np.std(preds_eval, axis=1)
-
-    # ============================================================
-    # Uncertainty Quality Metrics
-    # ============================================================
+    sample_std = np.mean(epistemic_std_eval, axis=1)
 
     # PREDICTION ERROR
     errors = y_eval - mean_pred_eval
@@ -385,7 +381,7 @@ def uqevaluation(num_test, test_data, model, data, method, hmcsamples=None, lasa
     # NEGATIVE LOG-LIKELIHOOD (proper scoring rule)
     nll = 0.5 * np.mean(np.log(2 * np.pi * total_var_eval) + squared_errors / total_var_eval)
 
-    return sample_std, [rmse, coverage_1sigma, coverage_2sigma, coverage_3sigma, mpiw, nll, np.mean(total_std_eval)]
+    return sample_std, np.array([rmse, coverage_1sigma, coverage_2sigma, coverage_3sigma, mpiw, nll, np.mean(total_std_eval)])
 
 def comparison_uq(result1,result2,result3):
     print("="*70)
@@ -462,14 +458,12 @@ def plot_uq(num_test, test_data, model, data, method, hmcsamples=None, lasamples
     
     if method == 'hmc':
     # Thin samples for visualization predictions
-        thin_factor = max(1, len(hmcsamples) // 30)
-        thinned_samples = hmcsamples[::thin_factor]
 
         # Compute predictions for each posterior sample (for visualization subset)
         print(f"Computing HMC predictions for {num_vis_samples} visualization samples...")
         with torch.no_grad():
             preds_list = []
-            for idx, s in enumerate(thinned_samples):
+            for idx, s in enumerate(hmcsamples): # pyright: ignore[reportArgumentType]
                 unpack_params(model, s.to(device))
                 x_tensor = torch.from_numpy(x_vis).float().to(device) if isinstance(x_vis, np.ndarray) else x_vis.to(device)
                 pred = model.predict(x_tensor)
@@ -487,7 +481,7 @@ def plot_uq(num_test, test_data, model, data, method, hmcsamples=None, lasamples
     elif method == 'la':
         preds_list = []
         with torch.no_grad():
-            for idx, s in enumerate(lasamples):
+            for idx, s in enumerate(lasamples):  # pyright: ignore[reportArgumentType]
                 unpack_params(model, s.to(device))
                 x_tensor = torch.from_numpy(x_vis).float().to(device) if isinstance(x_vis, np.ndarray) else x_vis.to(device)
                 pred = model.predict(x_tensor)
@@ -562,22 +556,23 @@ def plot_uq(num_test, test_data, model, data, method, hmcsamples=None, lasamples
 def run_regression_shift(method, levels, results):
     stats = {m: {'rmse': [], 'nll': [], 'unc': [], 'cov': []} for m in method}
 
-    for method, result in zip(method, results):
+    for met, result in zip(method, results):
         for i, lvl in enumerate(levels):
-            stats[method]['rmse'].append(result[i][0])
-            stats[method]['nll'].append(result[i][-2])
-            stats[method]['unc'].append(result[i][-1])
-            stats[method]['cov'].append(result[i][2])
+            stats[met]['rmse'].append(result[i][0])
+            stats[met]['cov'].append(result[i][2])
+            stats[met]['mpiw'].append(result[i][4])
+            stats[met]['nll'].append(result[i][5])
+            stats[met]['unc'].append(result[i][6])
 
-    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
+    fig, axes = plt.subplots(1, 5, figsize=(20, 4))
     
-    metrics = ['rmse', 'nll', 'unc', 'cov']
-    titles = ['RMSE (Error) (↓)', 'NLL (↓)', 'Uncertainty (Avg Std) (↑)', '95% Coverage (Target: 0.95)']
+    metrics = ['rmse', 'cov', 'mpiw', 'nll', 'unc']
+    titles = ['RMSE (Error) (↓)', '95% Coverage (Target: 0.95)' , 'MPIW (↓)', 'NLL (↓)', 'Uncertainty (Avg Std) (↑)']
     
     for i, metric in enumerate(metrics):
         ax = axes[i]
-        for method, data in stats.items():
-            ax.plot(levels, data[metric], marker='o', label=method)
+        for met, data in stats.items():
+            ax.plot(levels, data[metric], marker='o', label=met)
             
         # Draw target line for coverage
         if metric == 'cov':

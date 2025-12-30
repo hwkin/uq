@@ -7,7 +7,7 @@ import torch.nn as nn
 src_path = "/../../"
 import sys
 sys.path.append(src_path + 'plotting/')
-from field_plot import field_plot_grid as _field_plot_grid
+from field_plot import field_plot_grid as _field_plot_grid  # pyright: ignore[reportMissingImports]
 
 # --- Utilities to flatten/unflatten model parameters ---
 # NOTE: FNO models have complex-valued weights in SpectralConv layers.
@@ -19,7 +19,7 @@ def get_param_shapes(model):
 
 def get_param_info(model):
     """
-    Get parameter metadata including shapes, dtypes, and whether they are complex.
+    Get parameter metadata including shapes, dtyp es, and whether they are complex.
     Returns a list of tuples: (shape, dtype, is_complex)
     """
     info = []
@@ -315,7 +315,7 @@ def sgld(log_prob_fn, initial, step_size=1e-5, num_samples=500, burn_in=100,
         
         # Collect samples after burn-in
         if i >= burn_in:
-            samples.append(current.detach().cpu())
+            samples.append(current.detach().clone())
         
         # Progress reporting
         if (i + 1) % 100 == 0:
@@ -575,7 +575,7 @@ def hmc_adaptive(
         
         # Collect samples after burn-in
         if i >= burn_in:
-            samples.append(current.detach().cpu())
+            samples.append(current.detach().clone())
         
         # Progress reporting
         if (i + 1) % 50 == 0: 
@@ -771,91 +771,56 @@ def compute_diagonal_hessian(model, X, y, noise_std, prior_std, device,
     return H_diag
 
 
-def uqevaluation(test_data, model, data, method, hmc_samples=None, sgld_samples=None, la_samples=None):
+def uqevaluation(num_test, test_data, model, method, hmc_samples=None, sgld_samples=None, la_samples=None):
     aleatoric_std=0.05
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    eval_indices = np.random.choice(len(test_data["X_train"]), num_test, replace=False)
+    eval_indices.sort()
     epoch_mcd = 100
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     if torch.is_tensor(test_data["X_train"]):
         X_test_tensor = test_data["X_train"].clone().detach().to(device)
+        X_test_tensor = X_test_tensor[eval_indices]
     else:
         X_test_tensor = torch.from_numpy(test_data["X_train"]).float().to(device)
-    Y_train_raw = test_data["Y_train"]
-    if torch.is_tensor(Y_train_raw):
-        Y_test_decoded = data.decoder_Y(Y_train_raw.cpu().numpy())
-    else:
-        Y_test_decoded = data.decoder_Y(Y_train_raw)
+        X_test_tensor = X_test_tensor[eval_indices]
+    y_eval = test_data['Y_train'].reshape(test_data["Y_train"].shape[0], -1)
+    y_eval = y_eval[eval_indices]
 
     if method == 'hmc':
-        if hmc_samples is None:
-            raise ValueError("hmc_samples cannot be None for method='hmc'")
-        if hasattr(hmc_samples, "__len__") and len(hmc_samples) == 0:
-            raise ValueError("hmc_samples is empty")
         predictions = []
-        # Handle both tensor and list of tensors
-        if torch.is_tensor(hmc_samples):
-            for i in range(hmc_samples.shape[0]):
-                sample_params = hmc_samples[i]
-                unpack_params(model, sample_params)
-                with torch.no_grad():
-                    pred = model(X_test_tensor)
-                    pred_decoded = data.decoder_Y(pred.cpu().numpy())
-                    predictions.append(pred_decoded)
-        else:
-            for i, sample_params in enumerate(hmc_samples):
-                unpack_params(model, sample_params)
-                with torch.no_grad():
-                    pred = model(X_test_tensor)
-                    pred_decoded = data.decoder_Y(pred.cpu().numpy())
-                    predictions.append(pred_decoded)
+        for i in range(hmc_samples.shape[0]): # pyright: ignore[reportOptionalMemberAccess]
+            sample_params = hmc_samples[i] # pyright: ignore[reportOptionalSubscript]
+            unpack_params(model, sample_params)
+            with torch.no_grad():
+                pred = model(X_test_tensor).detach().cpu().numpy()
+                pred = pred.reshape(pred.shape[0], -1)
+                predictions.append(pred)
         predictions = np.array(predictions)
 
     elif method == 'sgld':
-        if sgld_samples is None:
-            raise ValueError("sgld_samples cannot be None for method='sgld'")
-        if hasattr(sgld_samples, "__len__") and len(sgld_samples) == 0:
-            raise ValueError("sgld_samples is empty - SGLD sampling may have failed")
         pred_batch_size = 20  # Adjust based on available GPU memory
         # Get predictions from each SGLD sample using mini-batches
         predictions = []
         # Handle both tensor and list of tensors
-        if torch.is_tensor(sgld_samples):
-            for i in range(sgld_samples.shape[0]):
-                sample_params = sgld_samples[i]
-                unpack_params(model, sample_params)
-                # Process test data in mini-batches
-                sample_preds = []
-                num_test_samples = X_test_tensor.shape[0]
-                with torch.no_grad():
-                    for start_idx in range(0, num_test_samples, pred_batch_size):
-                        end_idx = min(start_idx + pred_batch_size, num_test_samples)
-                        X_batch = X_test_tensor[start_idx:end_idx]
-                        pred_batch = model(X_batch)
-                        pred_decoded_batch = data.decoder_Y(pred_batch.cpu().numpy())
-                        sample_preds.append(pred_decoded_batch)
-                        # Clear GPU cache periodically
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                # Concatenate all batches for this sample
-                predictions.append(np.concatenate(sample_preds, axis=0))
-        else:
-            for i, sample_params in enumerate(sgld_samples):
-                unpack_params(model, sample_params)
-                # Process test data in mini-batches
-                sample_preds = []
-                num_test_samples = X_test_tensor.shape[0]
-                with torch.no_grad():
-                    for start_idx in range(0, num_test_samples, pred_batch_size):
-                        end_idx = min(start_idx + pred_batch_size, num_test_samples)
-                        X_batch = X_test_tensor[start_idx:end_idx]
-                        pred_batch = model(X_batch)
-                        pred_decoded_batch = data.decoder_Y(pred_batch.cpu().numpy())
-                        sample_preds.append(pred_decoded_batch)
-                        # Clear GPU cache periodically
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                # Concatenate all batches for this sample
-                predictions.append(np.concatenate(sample_preds, axis=0))
+        for i in range(sgld_samples.shape[0]): # pyright: ignore[reportOptionalMemberAccess]
+            sample_params = sgld_samples[i] # pyright: ignore[reportOptionalSubscript]
+            unpack_params(model, sample_params)
+            # Process test data in mini-batches
+            sample_preds = []
+            num_test_samples = X_test_tensor.shape[0]
+            with torch.no_grad():
+                for start_idx in range(0, num_test_samples, pred_batch_size):
+                    end_idx = min(start_idx + pred_batch_size, num_test_samples)
+                    X_batch = X_test_tensor[start_idx:end_idx]
+                    pred_batch = model(X_batch).detach().cpu().numpy()
+                    pred_batch = pred_batch.reshape(pred_batch.shape[0], -1)
+                    sample_preds.append(pred_batch)
+                    # Clear GPU cache periodically
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            # Concatenate all batches for this sample
+            predictions.append(np.concatenate(sample_preds, axis=0))
         predictions = np.array(predictions)
 
     elif method == 'mcd':
@@ -863,134 +828,102 @@ def uqevaluation(test_data, model, data, method, hmc_samples=None, sgld_samples=
         print("Running MC Dropout sampling...")
         for i in range(epoch_mcd):
             with torch.no_grad():
-                pred = model(X_test_tensor)
-                pred_decoded = data.decoder_Y(pred.cpu().numpy())
-                predictions.append(pred_decoded)
+                pred = model(X_test_tensor).detach().cpu().numpy()
+                pred = pred.reshape(pred.shape[0], -1)
+                predictions.append(pred)
         predictions = np.array(predictions)
-        print(f"MC Dropout predictions shape: {predictions.shape}")
 
     elif method == 'la':
-        if la_samples is None:
-            raise ValueError("la_samples cannot be None for method='la'")
-        if hasattr(la_samples, "__len__") and len(la_samples) == 0:
-            raise ValueError("la_samples is empty")
         predictions=[]
-        # Handle both tensor and list of tensors
-        if torch.is_tensor(la_samples):
-            for i in range(la_samples.shape[0]):
-                sample_params = la_samples[i]
-                unpack_params(model, sample_params)
-                with torch.no_grad():
-                    pred = model(X_test_tensor)
-                    pred_decoded = data.decoder_Y(pred.cpu().numpy())
-                    predictions.append(pred_decoded)
-        else:
-            for i, sample_params in enumerate(la_samples):
-                unpack_params(model, sample_params)
-                with torch.no_grad():
-                    pred = model(X_test_tensor)
-                    pred_decoded = data.decoder_Y(pred.cpu().numpy())
-                    predictions.append(pred_decoded)
+        for i in range(la_samples.shape[0]): # pyright: ignore[reportOptionalMemberAccess]
+            sample_params = la_samples[i] # pyright: ignore[reportOptionalSubscript]
+            unpack_params(model, sample_params)
+            with torch.no_grad():
+                pred = model(X_test_tensor).detach().cpu().numpy()
+                pred = pred.reshape(pred.shape[0], -1)
+                predictions.append(pred)
         predictions = np.array(predictions)
     else:
         raise ValueError(f"Unknown method: {method}")
+    
     # Compute statistics
     mean_eval = np.mean(predictions, axis=0)  # (N_test, ...)
     epistemic_std_eval = np.std(predictions, axis=0)    # Epistemic uncertainty
-    
-    # Flatten for metrics computation
-    mean_eval = mean_eval.reshape(mean_eval.shape[0], -1)  # (N_test, output_dim)
-    epistemic_std_eval = epistemic_std_eval.reshape(epistemic_std_eval.shape[0], -1)
-    y_eval = Y_test_decoded.reshape(Y_test_decoded.shape[0], -1)
-    
-    # Compute variance components
     epistemic_var_eval = epistemic_std_eval ** 2
     aleatoric_var_eval = aleatoric_std ** 2
     total_var_eval = epistemic_var_eval + aleatoric_var_eval
     total_std_eval = np.sqrt(total_var_eval)
+    sample_std = np.std(predictions, axis=1)
     
-    # 1. PREDICTION ERROR
+    # PREDICTION ERROR
     errors = y_eval - mean_eval
-    abs_errors = np.abs(errors)
     squared_errors = errors ** 2
-
     rmse = np.sqrt(np.mean(squared_errors))
 
-    # 2. CALIBRATION
+    # CALIBRATION
     z_scores = np.abs(errors) / total_std_eval
 
     coverage_1sigma = np.mean(z_scores <= 1.0)
     coverage_2sigma = np.mean(z_scores <= 2.0)
     coverage_3sigma = np.mean(z_scores <= 3.0)
 
-    # 3. SHARPNESS
+    # SHARPNESS
     num_sigma = 2.0
     widths = 2 * num_sigma * total_std_eval
     mpiw = np.mean(widths)
 
-    # 4. NEGATIVE LOG-LIKELIHOOD
+    # NEGATIVE LOG-LIKELIHOOD
     total_var_safe = np.maximum(total_var_eval, 1e-12)
     nll = 0.5 * np.mean(np.log(2 * np.pi * total_var_safe) + squared_errors / total_var_safe)
-    print(f"\n6. PROPER SCORING RULES:")
-    print(f"   Negative Log-Likelihood: {nll:.4f}")
-    print(f"   (Lower is better)")
-
-    print("\n" + "="*60)
     
     # Return metrics dict and computed values for compatibility
-    metrics = {
-        'RMSE': rmse,
-        'Coverage_1σ': coverage_1sigma * 100,
-        'Coverage_2σ': coverage_2sigma * 100,
-        'Coverage_3σ': coverage_3sigma * 100,
-        'MPIW': mpiw,
-        'NLL': nll,
-        'Uncertainty_Mean_Std': np.mean(total_std_eval)
-    }
-    return metrics, total_std_eval
+    return sample_std, np.array([rmse, coverage_1sigma, coverage_2sigma, coverage_3sigma, mpiw, nll, np.mean(total_std_eval)])
 
+def comparison_uq(result1,result2,result3,result4):
+    print("="*70)
+    print("COMPARISON: HMC vs SGLD vs MC Dropout vs Laplace Approximation")
+    print("="*70)
 
-def comparison_plotting(hmc_metrics, sgld_metrics, mcd_metrics, la_metrics):
     comparison_data = {
         'Metric': [
             'RMSE', 
             'Coverage 1σ (%)',
             'Coverage 2σ (%)',
             'Coverage 3σ (%)',
-            'MPIW'
+            'MPIW',
             'NLL'
         ],
         'HMC': [
-            f'{hmc_metrics["RMSE"]:.6f}',
-            f'{hmc_metrics["Coverage_1σ"]:.1f}',
-            f'{hmc_metrics["Coverage_2σ"]:.1f}',
-            f'{hmc_metrics["Coverage_3σ"]:.1f}',
-            f'{hmc_metrics["MPIW"]:.3f}',
-            f'{hmc_metrics["NLL"]:.4f}'
+            f'{result1[0]:.6f}',
+            f'{result1[1]*100:.1f}',
+            f'{result1[2]*100:.1f}',
+            f'{result1[3]*100:.1f}',
+            f'{result1[4]:.4f}',
+            f'{result1[5]:.4f}'
         ],
         'SGLD': [
-            f'{sgld_metrics["RMSE"]:.6f}',
-            f'{sgld_metrics["Coverage_1σ"]:.1f}',
-            f'{sgld_metrics["Coverage_2σ"]:.1f}',
-            f'{sgld_metrics["Coverage_3σ"]:.1f}',
-            f'{sgld_metrics["MPIW"]:.3f}',
-            f'{sgld_metrics["NLL"]:.4f}'
+            f'{result2[0]:.6f}',
+            f'{result2[1]*100:.1f}',
+            f'{result2[2]*100:.1f}',
+            f'{result2[3]*100:.1f}',
+            f'{result2[4]:.4f}',
+            f'{result2[5]:.4f}'
         ],
         'MC Dropout': [
-            f'{mcd_metrics["RMSE"]:.6f}',
-            f'{mcd_metrics["Coverage_1σ"]:.1f}',
-            f'{mcd_metrics["Coverage_2σ"]:.1f}',
-            f'{mcd_metrics["Coverage_3σ"]:.1f}',
-            f'{mcd_metrics["MPIW"]:.3f}',
-            f'{mcd_metrics["NLL"]:.4f}'
+            f'{result3[0]:.6f}',
+            f'{result3[1]*100:.1f}',
+            f'{result3[2]*100:.1f}',
+            f'{result3[3]*100:.1f}',
+            f'{result3[4]:.4f}',
+            f'{result3[5]:.4f}'
         ],
         'Laplace': [
-            f'{la_metrics["RMSE"]:.6f}',
-            f'{la_metrics["Coverage_1σ"]:.1f}',
-            f'{la_metrics["Coverage_2σ"]:.1f}',
-            f'{la_metrics["Coverage_3σ"]:.1f}',
-            f'{la_metrics["MPIW"]:.3f}',
-            f'{la_metrics["NLL"]:.4f}'
+            f'{result4[0]:.6f}',
+            f'{result4[1]*100:.1f}',
+            f'{result4[2]*100:.1f}',
+            f'{result4[3]*100:.1f}',
+            f'{result4[4]:.4f}',
+            f'{result4[5]:.4f}'
         ],
         'Ideal': [
             'Lower',
@@ -1003,8 +936,8 @@ def comparison_plotting(hmc_metrics, sgld_metrics, mcd_metrics, la_metrics):
     }
 
     # Print comparison table
-    print("\n{:<25} {:>12} {:>12} {:>12} {:>12} {:>10}".format('Metric', 'HMC', 'SGLD', 'MC Dropout', 'Laplace', 'Ideal'))
-    print("-" * 100)
+    print("\n{:<25} {:>12} {:>12} {:>12} {:>12} {:>10}".format('Metric', 'HMC', 'SSGLD', 'MC Dropout', 'Laplace', 'Ideal'))
+    print("-" * 85)
     for i in range(len(comparison_data['Metric'])):
         print("{:<25} {:>12} {:>12} {:>12} {:>12} {:>10}".format(
             comparison_data['Metric'][i],
@@ -1018,22 +951,23 @@ def comparison_plotting(hmc_metrics, sgld_metrics, mcd_metrics, la_metrics):
 def run_regression_shift(method, levels, results):
     stats = {m: {'rmse': [], 'nll': [], 'unc': [], 'cov': []} for m in method}
 
-    for method, result in zip(method, results):
+    for met, result in zip(method, results):
         for i, lvl in enumerate(levels):
-            stats[method]['rmse'].append(result[i]['RMSE'])
-            stats[method]['nll'].append(result[i]['NLL'])
-            stats[method]['unc'].append(result[i]['Uncertainty_Mean_Std'])
-            stats[method]['cov'].append(result[i]['Coverage_2σ'] / 100.0)  # Convert to [0,1] range
+            stats[met]['rmse'].append(result[i][0])
+            stats[met]['cov'].append(result[i][2])
+            stats[met]['mpiw'].append(result[i][4])
+            stats[met]['nll'].append(result[i][5])
+            stats[met]['unc'].append(result[i][6])
 
-    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
+    fig, axes = plt.subplots(1, 5, figsize=(20, 4))
     
-    metrics = ['rmse', 'nll', 'unc', 'cov']
-    titles = ['RMSE (Error) (↓)', 'NLL (↓)', 'Uncertainty (Avg Std) (↑)', '95% Coverage (Target: 0.95)']
+    metrics = ['rmse', 'cov', 'mpiw', 'nll', 'unc']
+    titles = ['RMSE (Error) (↓)', '95% Coverage (Target: 0.95)' , 'MPIW (↓)', 'NLL (↓)', 'Uncertainty (Avg Std) (↑)']
     
     for i, metric in enumerate(metrics):
         ax = axes[i]
-        for method, data in stats.items():
-            ax.plot(levels, data[metric], marker='o', label=method)
+        for met, data in stats.items():
+            ax.plot(levels, data[metric], marker='o', label=met)
             
         # Draw target line for coverage
         if metric == 'cov':

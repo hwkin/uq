@@ -7,7 +7,7 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 import sys
 src_path = "/../../"
 sys.path.append(src_path + 'plotting/')
-from field_plot import field_plot
+from field_plot import field_plot # pyright: ignore[reportMissingImports]
 from sklearn.metrics import log_loss, accuracy_score
 
 # --- Utilities to flatten/unflatten model parameters ---
@@ -178,7 +178,7 @@ def hmc_adaptive(log_prob_fn, initial, target_accept=0.75, initial_step_size=1e-
         
         # Collect samples after burn-in
         if i >= burn_in:
-            samples.append(current.detach().cpu())
+            samples.append(current.detach().clone())
         
         # Progress reporting
         if (i + 1) % 50 == 0:
@@ -302,30 +302,27 @@ def inject_dropout(model, target_layer_type=nn.Linear, dropout_rate=0.1):
         else:
             inject_dropout(child, target_layer_type, dropout_rate)
 
-def uqevaluation(num_test, test_data, model, method, hmcsamples=None, lasamples=None):
+def uqevaluation(num_test, test_data, model, method, hmc_samples=None, la_samples=None):
 
     # Define noise standard deviation (should match the value used in HMC sampling)
     noise_std = 0.05
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    # Use a larger subset for statistical evaluation
-    # num_eval_samples = min(200, num_test)  # Evaluate on 200 samples
-    num_eval_samples = num_test
-    eval_indices = np.random.choice(num_test, num_eval_samples, replace=False)
+    eval_indices = np.random.choice(len(test_data["X_train"]), num_test, replace=False)
+    eval_indices.sort()
     epoch_mcd = 100
 
     x_branch_eval = test_data['X_train'][eval_indices]
     x_trunk_eval = test_data['X_trunk']
     y_eval = test_data['Y_train'][eval_indices]
 
-    print(f"Evaluating uncertainty on {num_eval_samples} test samples...")
+    print(f"Evaluating uncertainty on {num_test} test samples...")
     
     if method == 'hmc':
         # Compute predictions for each posterior sample
         print("Computing posterior predictions...")
         with torch.no_grad():
             preds_eval_list = []
-            for idx, s in enumerate(hmcsamples):
+            for idx, s in enumerate(hmc_samples): # pyright: ignore[reportArgumentType]
                 unpack_params(model, s.to(device))
                 x_b = torch.from_numpy(x_branch_eval).float().to(device)
                 x_t = torch.from_numpy(x_trunk_eval).float().to(device)
@@ -348,7 +345,7 @@ def uqevaluation(num_test, test_data, model, method, hmcsamples=None, lasamples=
         print("Computing Laplace posterior predictions...")
         preds_eval_list = []
         with torch.no_grad():
-            for idx, s in enumerate(lasamples):
+            for idx, s in enumerate(la_samples): # pyright: ignore[reportArgumentType]
                 unpack_params(model, s.to(device))
                 x_b = torch.from_numpy(x_branch_eval).float().to(device)
                 x_t = torch.from_numpy(x_trunk_eval).float().to(device)
@@ -363,13 +360,9 @@ def uqevaluation(num_test, test_data, model, method, hmcsamples=None, lasamples=
     aleatoric_var_eval = noise_std ** 2
     total_var_eval = epistemic_var_eval + aleatoric_var_eval
     total_std_eval = np.sqrt(total_var_eval)
-    sample_std = np.std(preds_eval, axis=1)
+    sample_std = np.mean(epistemic_std_eval, axis=1)
 
-    # ============================================================
-    # Uncertainty Quality Metrics
-    # ============================================================
-
-    # 1. PREDICTION ERROR
+    # PREDICTION ERROR
     errors = y_eval - mean_pred_eval
     squared_errors = errors ** 2
     rmse = np.sqrt(np.mean(squared_errors))
@@ -390,9 +383,102 @@ def uqevaluation(num_test, test_data, model, method, hmcsamples=None, lasamples=
     nll = 0.5 * np.mean(np.log(2 * np.pi * total_var_eval) + squared_errors / total_var_eval)
 
     # Return epistemic standard deviation (useful for OOD detection) and summary metrics
-    return sample_std, [rmse, coverage_1sigma, coverage_2sigma, coverage_3sigma, mpiw, nll, np.mean(total_std_eval)]
+    return sample_std, np.array([rmse, coverage_1sigma, coverage_2sigma, coverage_3sigma, mpiw, nll, np.mean(total_std_eval)])
 
-def plot_uq(num_test, test_data, model, data, method, hmcsamples=None, lasamples=None):
+def comparison_uq(result1,result2,result3):
+    print("="*70)
+    print("COMPARISON: HMC vs MC Dropout vs Laplace Approximation")
+    print("="*70)
+
+    comparison_data = {
+        'Metric': [
+            'RMSE', 
+            'Coverage 1σ (%)',
+            'Coverage 2σ (%)',
+            'Coverage 3σ (%)',
+            'MPIW',
+            'NLL'
+        ],
+        'HMC': [
+            f'{result1[0]:.6f}',
+            f'{result1[1]*100:.1f}',
+            f'{result1[2]*100:.1f}',
+            f'{result1[3]*100:.1f}',
+            f'{result1[4]:.4f}',
+            f'{result1[5]:.4f}'
+        ],
+        'MC Dropout': [
+            f'{result2[0]:.6f}',
+            f'{result2[1]*100:.1f}',
+            f'{result2[2]*100:.1f}',
+            f'{result2[3]*100:.1f}',
+            f'{result2[4]:.4f}',
+            f'{result2[5]:.4f}'
+        ],
+        'Laplace': [
+            f'{result3[0]:.6f}',
+            f'{result3[1]*100:.1f}',
+            f'{result3[2]*100:.1f}',
+            f'{result3[3]*100:.1f}',
+            f'{result3[4]:.4f}',
+            f'{result3[5]:.4f}'
+        ],
+        'Ideal': [
+            'Lower',
+            '68.3',
+            '95.4',
+            '99.7',
+            'Lower',
+            'Lower'
+        ]
+    }
+
+    # Print comparison table
+    print("\n{:<25} {:>12} {:>12} {:>12} {:>10}".format('Metric', 'HMC', 'MC Dropout', 'Laplace', 'Ideal'))
+    print("-" * 85)
+    for i in range(len(comparison_data['Metric'])):
+        print("{:<25} {:>12} {:>12} {:>12} {:>10}".format(
+            comparison_data['Metric'][i],
+            comparison_data['HMC'][i],
+            comparison_data['MC Dropout'][i],
+            comparison_data['Laplace'][i],
+            comparison_data['Ideal'][i]
+        ))
+
+def run_regression_shift(method, levels, results):
+    stats = {m: {'rmse': [], 'nll': [], 'unc': [], 'cov': []} for m in method}
+
+    for met, result in zip(method, results):
+        for i, lvl in enumerate(levels):
+            stats[met]['rmse'].append(result[i][0])
+            stats[met]['cov'].append(result[i][2])
+            stats[met]['mpiw'].append(result[i][4])
+            stats[met]['nll'].append(result[i][5])
+            stats[met]['unc'].append(result[i][6])
+
+    fig, axes = plt.subplots(1, 5, figsize=(20, 4))
+    
+    metrics = ['rmse', 'cov', 'mpiw', 'nll', 'unc']
+    titles = ['RMSE (Error) (↓)', '95% Coverage (Target: 0.95)' , 'MPIW (↓)', 'NLL (↓)', 'Uncertainty (Avg Std) (↑)']
+    
+    for i, metric in enumerate(metrics):
+        ax = axes[i]
+        for met, data in stats.items():
+            ax.plot(levels, data[metric], marker='o', label=met)
+            
+        # Draw target line for coverage
+        if metric == 'cov':
+            ax.axhline(0.95, color='black', linestyle='--', label='Ideal')
+            
+        ax.set_title(titles[i])
+        ax.set_xlabel('Shift Intensity')
+        ax.grid(True, alpha=0.3)
+        if i == 0: ax.legend()
+        
+    plt.tight_layout()
+    plt.show()
+
+def plot_uq(num_test, test_data, model, data, method, hmc_samples=None, lasamples=None):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     noise_std = 0.05
     # Define visualization parameters
@@ -405,13 +491,9 @@ def plot_uq(num_test, test_data, model, data, method, hmcsamples=None, lasamples
     y_vis = test_data['Y_train'][vis_indices]
 
     if method == 'hmc':
-        # Thin samples for visualization predictions
-        thin_factor = max(1, len(hmcsamples) // 30)
-        thinned_samples = hmcsamples[::thin_factor]
-
         with torch.no_grad():
             preds_list = []
-            for idx, s in enumerate(thinned_samples):
+            for idx, s in enumerate(hmc_samples): # pyright: ignore[reportArgumentType]
                 unpack_params(model, s.to(device))
                 x_b = torch.from_numpy(x_branch_vis).float().to(device)
                 x_t = torch.from_numpy(x_trunk_vis).float().to(device)
@@ -438,7 +520,7 @@ def plot_uq(num_test, test_data, model, data, method, hmcsamples=None, lasamples
         # Compute Laplace predictions for visualization set
         preds_list = []
         with torch.no_grad():
-            for idx, s in enumerate(lasamples):
+            for idx, s in enumerate(lasamples): # pyright: ignore[reportArgumentType]
                 unpack_params(model, s.to(device))
                 x_b = torch.from_numpy(x_branch_vis).float().to(device)
                 x_t = torch.from_numpy(x_trunk_vis).float().to(device)
@@ -519,96 +601,4 @@ def plot_uq(num_test, test_data, model, data, method, hmcsamples=None, lasamples
             axs[i,j].axis('off')
 
     fig.tight_layout()
-    plt.show()
-
-def comparison_uq(result1,result2,result3):
-    print("="*70)
-    print("COMPARISON: HMC vs MC Dropout vs Laplace Approximation")
-    print("="*70)
-
-    comparison_data = {
-        'Metric': [
-            'RMSE', 
-            'Coverage 1σ (%)',
-            'Coverage 2σ (%)',
-            'Coverage 3σ (%)',
-            'MPIW',
-            'NLL'
-        ],
-        'HMC': [
-            f'{result1[0]:.6f}',
-            f'{result1[1]*100:.1f}',
-            f'{result1[2]*100:.1f}',
-            f'{result1[3]*100:.1f}',
-            f'{result1[4]:.4f}',
-            f'{result1[5]:.4f}'
-        ],
-        'MC Dropout': [
-            f'{result2[0]:.6f}',
-            f'{result2[1]*100:.1f}',
-            f'{result2[2]*100:.1f}',
-            f'{result2[3]*100:.1f}',
-            f'{result2[4]:.4f}',
-            f'{result2[5]:.4f}'
-        ],
-        'Laplace': [
-            f'{result3[0]:.6f}',
-            f'{result3[1]*100:.1f}',
-            f'{result3[2]*100:.1f}',
-            f'{result3[3]*100:.1f}',
-            f'{result3[4]:.4f}',
-            f'{result3[5]:.4f}'
-        ],
-        'Ideal': [
-            'Lower',
-            '68.3',
-            '95.4',
-            '99.7',
-            'Lower',
-            'Lower'
-        ]
-    }
-
-    # Print comparison table
-    print("\n{:<25} {:>12} {:>12} {:>12} {:>10}".format('Metric', 'HMC', 'MC Dropout', 'Laplace', 'Ideal'))
-    print("-" * 85)
-    for i in range(len(comparison_data['Metric'])):
-        print("{:<25} {:>12} {:>12} {:>12} {:>10}".format(
-            comparison_data['Metric'][i],
-            comparison_data['HMC'][i],
-            comparison_data['MC Dropout'][i],
-            comparison_data['Laplace'][i],
-            comparison_data['Ideal'][i]
-        ))
-
-def run_regression_shift(method, levels, results):
-    stats = {m: {'rmse': [], 'nll': [], 'unc': [], 'cov': []} for m in method}
-
-    for met, result in zip(method, results):
-        for i, lvl in enumerate(levels):
-            stats[met]['rmse'].append(result[i][0])
-            stats[met]['nll'].append(result[i][-2])
-            stats[met]['unc'].append(result[i][-1])
-            stats[met]['cov'].append(result[i][2])
-
-    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
-    
-    metrics = ['rmse', 'nll', 'unc', 'cov']
-    titles = ['RMSE (Error) (↓)', 'NLL (↓)', 'Uncertainty (Avg Std) (↑)', '95% Coverage (Target: 0.95)']
-    
-    for i, metric in enumerate(metrics):
-        ax = axes[i]
-        for met, data in stats.items():
-            ax.plot(levels, data[metric], marker='o', label=met)
-            
-        # Draw target line for coverage
-        if metric == 'cov':
-            ax.axhline(0.95, color='black', linestyle='--', label='Ideal')
-            
-        ax.set_title(titles[i])
-        ax.set_xlabel('Shift Intensity')
-        ax.grid(True, alpha=0.3)
-        if i == 0: ax.legend()
-        
-    plt.tight_layout()
     plt.show()
