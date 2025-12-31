@@ -784,7 +784,8 @@ def uqevaluation(num_test, test_data, model, method, hmc_samples=None, sgld_samp
     else:
         X_test_tensor = torch.from_numpy(test_data["X_train"]).float().to(device)
         X_test_tensor = X_test_tensor[eval_indices]
-    y_eval = test_data['Y_train'].reshape(test_data["Y_train"].shape[0], -1)
+    y_eval = test_data['Y_train'].detach().cpu().numpy()
+    y_eval = y_eval.reshape(y_eval.shape[0], -1)
     y_eval = y_eval[eval_indices]
 
     if method == 'hmc':
@@ -853,7 +854,7 @@ def uqevaluation(num_test, test_data, model, method, hmc_samples=None, sgld_samp
     aleatoric_var_eval = aleatoric_std ** 2
     total_var_eval = epistemic_var_eval + aleatoric_var_eval
     total_std_eval = np.sqrt(total_var_eval)
-    sample_std = np.std(predictions, axis=1)
+    sample_std = np.mean(epistemic_std_eval, axis=1)
     
     # PREDICTION ERROR
     errors = y_eval - mean_eval
@@ -949,7 +950,7 @@ def comparison_uq(result1,result2,result3,result4):
         ))
 
 def run_regression_shift(method, levels, results):
-    stats = {m: {'rmse': [], 'nll': [], 'unc': [], 'cov': []} for m in method}
+    stats = {m: {'rmse': [], 'mpiw':[], 'nll': [], 'unc': [], 'cov': []} for m in method}
 
     for met, result in zip(method, results):
         for i, lvl in enumerate(levels):

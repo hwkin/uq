@@ -446,7 +446,7 @@ def comparison_uq(result1,result2,result3):
         ))
 
 def run_regression_shift(method, levels, results):
-    stats = {m: {'rmse': [], 'nll': [], 'unc': [], 'cov': []} for m in method}
+    stats = {m: {'rmse': [], 'mpiw':[],'nll': [], 'unc': [], 'cov': []} for m in method}
 
     for met, result in zip(method, results):
         for i, lvl in enumerate(levels):
