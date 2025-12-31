@@ -1,5 +1,0 @@
-{
-    "python.languageServer": "Jedi",
-    "python.analysis.indexing": true,
-    "python.analysis.diagnosticMode": "openFilesOnly"
-}
