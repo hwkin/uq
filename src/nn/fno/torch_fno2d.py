@@ -13,7 +13,7 @@ class FNO2D(nn.Module):
     def __init__(self, num_layers, width, \
                  fourier_modes1, fourier_modes2, \
                  num_Y_components, save_file=None,
-                 dropout=False, dropout_rate=0.1):
+                 dropout=False, dropout_rate=0.1, heteroscedastic=False):
 
         super(FNO2D, self).__init__()
         self.name = 'FNO'
@@ -21,7 +21,7 @@ class FNO2D(nn.Module):
         # Set device (use CUDA if available)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f'Using device: {self.device}')
-
+        self.heteroscedastic = heteroscedastic
         self.save_file = save_file
         if save_file is None:
             self.save_file = './FNO_model/model.pkl'
@@ -53,7 +53,11 @@ class FNO2D(nn.Module):
 
         # define hidden-to-output projector 
         # project to the dimension of u(x) \in R^d_o
-        self.output_projector = nn.Linear(self.width, self.num_Y_components)
+        if self.heteroscedastic:
+            out_dim = self.num_Y_components * 2
+        else:
+            out_dim = self.num_Y_components
+        self.output_projector = nn.Linear(self.width, out_dim)
 
         # move entire model to device
         self.to(self.device)
@@ -90,7 +94,10 @@ class FNO2D(nn.Module):
 
         # hidden-to-output projector
         x = self.output_projector(x)
-
+        if self.heteroscedastic:
+            # split output into mean and log variance components
+            mean, log_var = torch.chunk(x, 2, dim=-1)
+            return mean, log_var
         return x
     
     def train(self, train_data, test_data, \
@@ -119,8 +126,11 @@ class FNO2D(nn.Module):
                                 batch_size=batch_size, shuffle=True)
 
         # loss and optimizer setup
-        criterion = nn.MSELoss()
-        optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=1e-4)
+        if self.heteroscedastic:
+            criterion = nn.GaussianNLLLoss()
+        else:
+            criterion = nn.MSELoss()
+        optimizer = optim.AdamW(self.parameters(), lr=lr, weight_decay=1e-4)
         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
 
         self.train_loss_log = np.zeros((epochs, 1))
@@ -149,15 +159,20 @@ class FNO2D(nn.Module):
                 X_train = X_train.to(self.device)
                 Y_train = Y_train.to(self.device)
 
+                # Dynamic batch size (prevents crash on last batch)
+                current_bs = X_train.shape[0]
+
                 # clear gradients
                 optimizer.zero_grad()
 
                 # forward pass through model
-                Y_train_pred = self.forward(X_train)
-
-                # compute and save loss
-                loss = criterion(Y_train_pred.view(batch_size, -1), \
-                                 Y_train.view(batch_size, -1)) 
+                if self.heteroscedastic:
+                    mu_pred, log_var_pred = self.forward(X_train)
+                    loss = criterion(mu_pred, log_var_pred, Y_train)
+                else:
+                    Y_train_pred = self.forward(X_train)
+                    loss = criterion(Y_train_pred.view(current_bs, -1), \
+                                     Y_train.view(current_bs, -1))
                 train_losses.append(loss.item())
 
                 # backward pass
@@ -176,13 +191,15 @@ class FNO2D(nn.Module):
                     # move data to device
                     X_test = X_test.to(self.device)
                     Y_test = Y_test.to(self.device)
+                    current_bs = X_test.shape[0]
 
-                    # forward pass through model
-                    Y_test_pred = self.forward(X_test)
-
-                    # compute and save test loss
-                    test_loss = criterion(Y_test_pred.view(batch_size, -1), \
-                                          Y_test.view(batch_size, -1))
+                    if self.heteroscedastic:
+                        mu_test, log_var_test = self.forward(X_test)
+                        test_loss = criterion(mu_test, log_var_test, Y_test)
+                    else:
+                        Y_test_pred = self.forward(X_test)
+                        test_loss = criterion(Y_test_pred.view(current_bs, -1), \ 
+                                              Y_test.view(current_bs, -1))
                     test_losses.append(test_loss.item())
 
             # log losses
@@ -203,7 +220,7 @@ class FNO2D(nn.Module):
 
             # check if we need to save model parameters
             if save_model == True and (epoch % save_epoch == 0 or epoch == epochs):
-                torch.save(self, self.save_file)
+                torch.save(self, self.save_file) # pyright: ignore[reportArgumentType]
                 print('-'*50)
                 print('Model parameters saved at epoch {}'.format(epoch))
                 print('-'*50)

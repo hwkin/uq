@@ -228,14 +228,27 @@ def make_log_prob_fn(
         
         if batch_size is None or batch_size >= N:
             # Use all data (original behavior)
-            pred = _functional_forward(model, flat_params, X)
-            resid = (y - pred).reshape(N, -1)
-            # Log-likelihood (Gaussian)
-            if reduce_output_mean:
-                resid2 = resid.pow(2).mean(dim=1).sum()
+            if model.heteroscedastic:
+                mu, log_var = _functional_forward(model, flat_params, X)
+                resid = (y - mu).reshape(N, -1)
+                var = torch.exp(log_var).reshape(N, -1)
+                # Log-likelihood (Gaussian with heteroscedastic noise)
+                if reduce_output_mean:
+                    resid2 = (resid.pow(2) / var).mean(dim=1).sum()
+                    log_det = log_var.mean(dim=1).sum()
+                else:
+                    resid2 = (resid.pow(2) / var).sum()
+                    log_det = log_var.sum()
+                ll = -0.5 * (resid2 + log_det)
             else:
-                resid2 = resid.pow(2).sum()
-            ll = -0.5 * (resid2 / (noise_std**2))
+                pred = _functional_forward(model, flat_params, X)
+                resid = (y - pred).reshape(N, -1)
+                # Log-likelihood (Gaussian)
+                if reduce_output_mean:
+                    resid2 = resid.pow(2).mean(dim=1).sum()
+                else:
+                    resid2 = resid.pow(2).sum()
+                ll = -0.5 * (resid2 / (noise_std**2))
         else:
             # Mini-batch estimation with scaling
             # Randomly select a mini-batch
@@ -243,88 +256,27 @@ def make_log_prob_fn(
             X_batch = X[indices]
             y_batch = y[indices]
             
-            pred = _functional_forward(model, flat_params, X_batch)
-            resid = (y_batch - pred).reshape(batch_size, -1)
-            # Scale log-likelihood to account for mini-batch
-            # Always use reduce_output_mean=True for mini-batch to avoid numerical instability
-            # This computes per-sample MSE then sums, which is more stable than summing all points
-            resid2 = resid.pow(2).mean(dim=1).sum()
-            # Scale by (N/batch_size) to account for using only a subset of data
-            ll = -0.5 * (resid2 / (noise_std**2)) * (N / batch_size)
+            if model.heteroscedastic:
+                mu_batch, log_var_batch = _functional_forward(model, flat_params, X_batch)
+                resid = (y_batch - mu_batch).reshape(batch_size, -1)
+                var = torch.exp(log_var_batch).reshape(batch_size, -1)
+                # Log-likelihood (Gaussian with heteroscedastic noise)
+                if reduce_output_mean:
+                    resid2 = (resid.pow(2) / var).mean(dim=1).sum()
+                    log_det = log_var_batch.mean(dim=1).sum()
+                else:
+                    resid2 = (resid.pow(2) / var).sum()
+                    log_det = log_var_batch.sum()
+                ll = -0.5 * (resid2 + log_det) * (N / batch_size)
+            else:
+                pred = _functional_forward(model, flat_params, X_batch)
+                resid = (y_batch - pred).reshape(batch_size, -1)
+                resid2 = resid.pow(2).mean(dim=1).sum()
+                ll = -0.5 * (resid2 / (noise_std**2)) * (N / batch_size)
         
         return ll + lp
     
     return log_prob
-
-
-def sgld(log_prob_fn, initial, step_size=1e-5, num_samples=500, burn_in=100,
-         step_decay=0.9999, min_step_size=1e-7, grad_clip=10.0):
-    """
-    Stochastic Gradient Langevin Dynamics (SGLD) sampler.
-    
-    SGLD is better suited for mini-batch settings than standard HMC because it
-    doesn't require Hamiltonian conservation. It adds noise to SGD updates.
-    
-    Args:
-        log_prob_fn: Function that computes log probability given flat parameters
-        initial: Initial parameter vector (requires_grad=True)
-        step_size: Initial step size (learning rate)
-        num_samples: Number of samples to collect after burn-in
-        burn_in: Number of burn-in iterations
-        step_decay: Multiplicative decay factor for step size per iteration
-        min_step_size: Minimum step size (to prevent collapse)
-    
-    Returns:
-        samples: List of parameter samples
-        final_step_size: Final step size
-    """
-    samples = []
-    current = initial.clone().detach().requires_grad_(True)
-    
-    total_iterations = num_samples + burn_in
-    eps = step_size
-    
-    print(f"Starting SGLD sampling...")
-    print(f"  Burn-in: {burn_in}, Samples: {num_samples}")
-    print(f"  Initial step size: {step_size:.2e}")
-    
-    for i in range(total_iterations):
-        # Compute gradient of log probability
-        lp = log_prob_fn(current)
-        if not torch.isfinite(lp):
-            print(f"Warning: non-finite log_prob at iter {i+1}; stopping early.")
-            break
-
-        grad = torch.autograd.grad(lp, current, create_graph=False)[0]
-        if not torch.isfinite(grad).all():
-            print(f"Warning: non-finite gradient at iter {i+1}; stopping early.")
-            break
-
-        # Clip gradients to prevent explosion (default: clip to [-10, 10])
-        if grad_clip is not None:
-            grad_norm = grad.norm()
-            if grad_norm > grad_clip:
-                grad = grad * (grad_clip / grad_norm)
-        
-        # SGLD update: θ_{t+1} = θ_t + (ε/2) * ∇log p(θ|D) + N(0, ε)
-        noise = torch.randn_like(current) * np.sqrt(eps)
-        current = (current + 0.5 * eps * grad + noise).detach().requires_grad_(True)
-        
-        # Decay step size
-        eps = max(eps * step_decay, min_step_size)
-        
-        # Collect samples after burn-in
-        if i >= burn_in:
-            samples.append(current.detach().clone())
-        
-        # Progress reporting
-        if (i + 1) % 100 == 0:
-            phase = "burn-in" if i < burn_in else "sampling"
-            print(f"Iter {i+1:4d}/{total_iterations}: step_size = {eps:.2e}, phase = {phase}")
-    
-    print(f"SGLD completed. Collected {len(samples)} samples.")
-    return samples, eps
-
 
 
 def hmc_adaptive(
@@ -592,6 +544,74 @@ def hmc_adaptive(
     
     return torch.stack(samples), final_accept_rate, step_size, step_size_history
 
+def sgld(log_prob_fn, initial, step_size=1e-5, num_samples=500, burn_in=100,
+         step_decay=0.9999, min_step_size=1e-7, grad_clip=10.0):
+    """
+    Stochastic Gradient Langevin Dynamics (SGLD) sampler.
+    
+    SGLD is better suited for mini-batch settings than standard HMC because it
+    doesn't require Hamiltonian conservation. It adds noise to SGD updates.
+    
+    Args:
+        log_prob_fn: Function that computes log probability given flat parameters
+        initial: Initial parameter vector (requires_grad=True)
+        step_size: Initial step size (learning rate)
+        num_samples: Number of samples to collect after burn-in
+        burn_in: Number of burn-in iterations
+        step_decay: Multiplicative decay factor for step size per iteration
+        min_step_size: Minimum step size (to prevent collapse)
+    
+    Returns:
+        samples: List of parameter samples
+        final_step_size: Final step size
+    """
+    samples = []
+    current = initial.clone().detach().requires_grad_(True)
+    
+    total_iterations = num_samples + burn_in
+    eps = step_size
+    
+    print(f"Starting SGLD sampling...")
+    print(f"  Burn-in: {burn_in}, Samples: {num_samples}")
+    print(f"  Initial step size: {step_size:.2e}")
+    
+    for i in range(total_iterations):
+        # Compute gradient of log probability
+        lp = log_prob_fn(current)
+        if not torch.isfinite(lp):
+            print(f"Warning: non-finite log_prob at iter {i+1}; stopping early.")
+            break
+
+        grad = torch.autograd.grad(lp, current, create_graph=False)[0]
+        if not torch.isfinite(grad).all():
+            print(f"Warning: non-finite gradient at iter {i+1}; stopping early.")
+            break
+
+        # Clip gradients to prevent explosion (default: clip to [-10, 10])
+        if grad_clip is not None:
+            grad_norm = grad.norm()
+            if grad_norm > grad_clip:
+                grad = grad * (grad_clip / grad_norm)
+        
+        # SGLD update: θ_{t+1} = θ_t + (ε/2) * ∇log p(θ|D) + N(0, ε)
+        noise = torch.randn_like(current) * np.sqrt(eps)
+        current = (current + 0.5 * eps * grad + noise).detach().requires_grad_(True)
+        
+        # Decay step size
+        eps = max(eps * step_decay, min_step_size)
+        
+        # Collect samples after burn-in
+        if i >= burn_in:
+            samples.append(current.detach().clone())
+        
+        # Progress reporting
+        if (i + 1) % 100 == 0:
+            phase = "burn-in" if i < burn_in else "sampling"
+            print(f"Iter {i+1:4d}/{total_iterations}: step_size = {eps:.2e}, phase = {phase}")
+    
+    print(f"SGLD completed. Collected {len(samples)} samples.")
+    return samples, eps
+
 
 def inject_dropout(model, target_layer_type=nn.Linear, dropout_rate=0.1):
     """
@@ -648,10 +668,6 @@ def inject_dropout(model, target_layer_type=nn.Linear, dropout_rate=0.1):
         else:
             inject_dropout(child, target_layer_type, dropout_rate)
 
-# ============================================================
-# Laplace Approximation for FNO
-# ============================================================
-
 def compute_diagonal_hessian(model, X, y, noise_std, prior_std, device, 
                              batch_size=20, sample_points_per_batch=50):
     """
@@ -688,7 +704,6 @@ def compute_diagonal_hessian(model, X, y, noise_std, prior_std, device,
     
     # Convert inputs to tensors once
     X_tensor = torch.from_numpy(X).float() if isinstance(X, np.ndarray) else X.clone()
-    y_tensor = torch.from_numpy(y).float() if isinstance(y, np.ndarray) else y.clone()
     
     n_samples = X_tensor.shape[0]
     nx, ny = X_tensor.shape[1], X_tensor.shape[2]
@@ -699,8 +714,7 @@ def compute_diagonal_hessian(model, X, y, noise_std, prior_std, device,
     
     # Scale factor to account for subsampling output points
     scale_factor = n_points / sample_points_per_batch
-    noise_var_inv = 1.0 / (noise_std ** 2)
-    
+
     # Process samples in batches
     for i in range(0, n_samples, batch_size):
         batch_end = min(i + batch_size, n_samples)
@@ -713,10 +727,15 @@ def compute_diagonal_hessian(model, X, y, noise_std, prior_std, device,
         sample_indices = np.random.choice(n_points, n_sample, replace=False)
         
         # Forward pass - use forward() to enable gradient computation
-        pred = model.forward(X_batch)  # (batch_size, nx, ny, num_Y_components)
-        
-        # Flatten spatial dimensions for easier indexing
-        pred_flat = pred.reshape(pred.shape[0], -1)  # (batch_size, nx*ny*num_Y_components)
+        if model.heteroscedastic:
+            pred, log_var = model.forward(X_batch)  # (batch_size, nx, ny, num_Y_components)
+            pred_flat = pred.reshape(pred.shape[0], -1)  # (batch_size, nx*ny*num_Y_components)
+            var = torch.exp(log_var).reshape(pred.shape[0], -1)  # (batch_size, nx*ny*num_Y_components)
+            noise_var_inv = 1.0 / var  # Heteroscedastic noise variance inverse
+        else:
+            pred = model.forward(X_batch)  # (batch_size, nx, ny, num_Y_components)
+            pred_flat = pred.reshape(pred.shape[0], -1)  # (batch_size, nx*ny*num_Y_components)
+            noise_var_inv = 1.0 / (noise_std ** 2)
         
         # Process each sample and sampled output point
         batch_size_actual = pred.shape[0]
@@ -727,15 +746,12 @@ def compute_diagonal_hessian(model, X, y, noise_std, prior_std, device,
                 for c in range(num_Y_components):
                     # Zero gradients before backward
                     model.zero_grad()
-                    
                     # Index into flattened prediction
                     flat_idx = k * num_Y_components + c
-                    
                     # Compute gradient for this specific output
                     # Only release graph on the very last backward pass for this batch
                     is_last_in_batch = (j == batch_size_actual - 1) and (idx == len(sample_indices) - 1) and (c == num_Y_components - 1)
                     pred_flat[j, flat_idx].backward(retain_graph=not is_last_in_batch)
-                    
                     # Accumulate squared gradients (diagonal Hessian approximation)
                     # Handle complex parameters by splitting into real/imag
                     grad_sq_sum = torch.zeros(n_params, device=device)
@@ -757,9 +773,11 @@ def compute_diagonal_hessian(model, X, y, noise_std, prior_std, device,
                                 offset += 2 * numel
                             else:
                                 offset += numel
-                    
-                    H_diag += grad_sq_sum * noise_var_inv * scale_factor
-        
+                        if not model.heteroscedastic:
+                            H_diag += grad_sq_sum * noise_var_inv * scale_factor
+                        else:
+                            H_diag += grad_sq_sum * noise_var_inv[j, flat_idx] * scale_factor # pyright: ignore[reportIndexIssue]
+
         # Explicitly delete tensors to free memory
         del pred, pred_flat, X_batch
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
@@ -769,7 +787,6 @@ def compute_diagonal_hessian(model, X, y, noise_std, prior_std, device,
             print(f"  Processed {batch_end}/{n_samples} samples")
     
     return H_diag
-
 
 def uqevaluation(num_test, test_data, model, method, hmc_samples=None, sgld_samples=None, la_samples=None):
     aleatoric_std=0.05
@@ -789,72 +806,99 @@ def uqevaluation(num_test, test_data, model, method, hmc_samples=None, sgld_samp
     y_eval = y_eval[eval_indices]
 
     if method == 'hmc':
-        predictions = []
-        for i in range(hmc_samples.shape[0]): # pyright: ignore[reportOptionalMemberAccess]
-            sample_params = hmc_samples[i] # pyright: ignore[reportOptionalSubscript]
-            unpack_params(model, sample_params)
-            with torch.no_grad():
-                pred = model(X_test_tensor).detach().cpu().numpy()
-                pred = pred.reshape(pred.shape[0], -1)
-                predictions.append(pred)
-        predictions = np.array(predictions)
-
+        with torch.no_grad():
+            preds_eval_list = []
+            if model.heteroscedastic: logvarlst = []
+            for idx,s in enumerate(hmc_samples) # pyright: ignore[reportArgumentType]
+                unpack_params(model, s)
+                if model.heteroscedastic:
+                    pred, log_var = model.forward(X_test_tensor)
+                    logvarlst.append(log_var.detach().cpu().numpy().reshape(log_var.shape[0], -1))
+                else:
+                    pred = model.forward(X_test_tensor)
+                pred = pred.reshape(pred.shape[0], -1).cpu().numpy()
+                preds_eval_list.append(pred)
+        preds_eval_list = np.stack(preds_eval_list)
+        if model.heteroscedastic: logvars = np.stack(logvarlst)
     elif method == 'sgld':
-        pred_batch_size = 20  # Adjust based on available GPU memory
-        # Get predictions from each SGLD sample using mini-batches
-        predictions = []
-        # Handle both tensor and list of tensors
-        for i in range(sgld_samples.shape[0]): # pyright: ignore[reportOptionalMemberAccess]
-            sample_params = sgld_samples[i] # pyright: ignore[reportOptionalSubscript]
-            unpack_params(model, sample_params)
-            # Process test data in mini-batches
-            sample_preds = []
-            num_test_samples = X_test_tensor.shape[0]
-            with torch.no_grad():
+        pred_batch_size = 20  
+        preds_eval_list = []
+        if model.heteroscedastic: logvarlst = []
+        with torch.no_grad():
+            for idx, s in enumerate(sgld_samples): # pyright: ignore[reportArgumentType]
+                unpack_params(model, s)
+                sample_preds = []
+                sample_logvarlst = []
+                num_test_samples = X_test_tensor.shape[0]
                 for start_idx in range(0, num_test_samples, pred_batch_size):
                     end_idx = min(start_idx + pred_batch_size, num_test_samples)
                     X_batch = X_test_tensor[start_idx:end_idx]
-                    pred_batch = model(X_batch).detach().cpu().numpy()
-                    pred_batch = pred_batch.reshape(pred_batch.shape[0], -1)
+                    if model.heteroscedastic:
+                        pred_batch, log_var_batch = model.forward(X_batch)
+                        sample_logvarlst.append(log_var_batch.reshape(log_var_batch.shape[0], -1).cpu().numpy())
+                    else:
+                        pred_batch = model.forward(X_batch)
+                    pred_batch = pred_batch.reshape(pred_batch.shape[0], -1).cpu().numpy()
                     sample_preds.append(pred_batch)
                     # Clear GPU cache periodically
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-            # Concatenate all batches for this sample
-            predictions.append(np.concatenate(sample_preds, axis=0))
-        predictions = np.array(predictions)
+                # Concatenate all batches for this sample
+                preds_eval_list.append(np.concatenate(sample_preds, axis=0))
+                if model.heteroscedastic:
+                    logvarlst.append(np.concatenate(sample_logvarlst, axis=0))
+        if model.heteroscedastic:
+            logvars = np.stack(logvarlst)
+        preds_eval_list = np.stack(preds_eval_list)
 
     elif method == 'mcd':
-        predictions = []
+        preds_eval_list = []
+        if model.heteroscedastic: logvarlst = []
         print("Running MC Dropout sampling...")
         for i in range(epoch_mcd):
             with torch.no_grad():
-                pred = model(X_test_tensor).detach().cpu().numpy()
-                pred = pred.reshape(pred.shape[0], -1)
-                predictions.append(pred)
-        predictions = np.array(predictions)
-
+                if model.heteroscedastic:
+                    pred, log_var = model.forward(X_test_tensor)
+                    logvarlst.append(log_var.detach().cpu().numpy().reshape(log_var.shape[0], -1))
+                else:
+                    pred = model.forward(X_test_tensor)
+                pred = pred.reshape(pred.shape[0], -1).cpu().numpy()
+                preds_eval_list.append(pred)
+        preds_eval_list = np.array(preds_eval_list)
+        if model.heteroscedastic: logvars = np.stack(logvarlst)
     elif method == 'la':
-        predictions=[]
+        preds_eval_list=[]
+        if model.heteroscedastic: logvarlst = []
         for i in range(la_samples.shape[0]): # pyright: ignore[reportOptionalMemberAccess]
             sample_params = la_samples[i] # pyright: ignore[reportOptionalSubscript]
             unpack_params(model, sample_params)
             with torch.no_grad():
-                pred = model(X_test_tensor).detach().cpu().numpy()
-                pred = pred.reshape(pred.shape[0], -1)
-                predictions.append(pred)
-        predictions = np.array(predictions)
+                if model.heteroscedastic:
+                    pred, log_var = model.forward(X_test_tensor)
+                    logvarlst.append(log_var.detach().cpu().numpy().reshape(log_var.shape[0], -1))
+                else:
+                    pred = model.forward(X_test_tensor)
+                pred = pred.reshape(pred.shape[0], -1).cpu().numpy()
+                preds_eval_list.append(pred)
+        preds_eval_list = np.array(preds_eval_list)
+        if model.heteroscedastic: logvars = np.stack(logvarlst)
     else:
         raise ValueError(f"Unknown method: {method}")
     
     # Compute statistics
-    mean_eval = np.mean(predictions, axis=0)  # (N_test, ...)
-    epistemic_std_eval = np.std(predictions, axis=0)    # Epistemic uncertainty
+    mean_eval = np.mean(preds_eval_list, axis=0)  # (N_test, ...)
+    epistemic_std_eval = np.std(preds_eval_list, axis=0)    # Epistemic uncertainty
     epistemic_var_eval = epistemic_std_eval ** 2
-    aleatoric_var_eval = aleatoric_std ** 2
+    if model.heteroscedastic:
+        aleatoric_var_eval = np.mean(np.exp(logvars), axis=0)  # Aleatoric uncertainty
+    else:
+        aleatoric_var_eval = aleatoric_std ** 2
     total_var_eval = epistemic_var_eval + aleatoric_var_eval
     total_std_eval = np.sqrt(total_var_eval)
-    sample_std = np.mean(epistemic_std_eval, axis=1)
+    if model.heteroscedastic:
+        sample_std = np.mean(total_std_eval, axis=1)
+    else:
+        sample_std = np.mean(epistemic_std_eval, axis=1)
     
     # PREDICTION ERROR
     errors = y_eval - mean_eval

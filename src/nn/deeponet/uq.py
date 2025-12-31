@@ -1,6 +1,7 @@
 from torch.nn.utils import parameters_to_vector, vector_to_parameters
 import torch
 import torch.nn as nn
+from torch.func import functional_call
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -47,15 +48,33 @@ def make_log_prob_fn(model, x_branch, x_trunk, y, noise_std=0.01, prior_std=1.0)
     x_branch = x_branch.to(device)
     x_trunk = x_trunk.to(device)
     y = y.to(device)
+    params_dict = dict(model.named_parameters())
+    buffers_dict = dict(model.named_buffers())
+    flat_shapes = []
+    flat_names = []
+    for name, p in params_dict.items():
+        flat_names.append(name)
+        flat_shapes.append(p.shape)
 
-    def log_prob(flat_params):
-        unpack_params(model, flat_params)
-        pred = model.forward(x_branch, x_trunk)  # Use forward to keep gradients
-        resid = (y - pred).reshape(y.shape[0], -1)
-        # Log-likelihood (Gaussian)
-        ll = -0.5 * (resid.pow(2).sum() / (noise_std**2))
+    def log_prob(flat_params_tensor):
+        curr_params_dict = {}
+        idx = 0
+        for name, shape in zip(flat_names, flat_shapes):
+            numel = shape.numel()
+            # View creates a differentiable link
+            curr_params_dict[name] = flat_params_tensor[idx:idx+numel].view(shape)
+            idx += numel
+        pred = functional_call(model, (curr_params_dict, buffers_dict), (x_branch, x_trunk))
+        if model.heteroscedastic:
+            mean_pred, logvar_pred = pred
+            inv_var = torch.exp(-logvar_pred)
+            ll = -0.5 * (logvar_pred + (y - mean_pred)**2 * inv_var).sum()
+        else:
+            resid = (y - pred).reshape(y.shape[0], -1)
+            # Log-likelihood (Gaussian)
+            ll = -0.5 * (resid.pow(2).sum() / (noise_std**2))
         # Log-prior (Gaussian)
-        lp = -0.5 * (flat_params.pow(2).sum() / (prior_std**2))
+        lp = -0.5 * (flat_params_tensor.pow(2).sum() / (prior_std**2))
         return ll + lp
     
     return log_prob
@@ -220,15 +239,15 @@ def compute_diagonal_hessian(model, x_branch, x_trunk, y, noise_std, prior_std, 
     # Convert inputs to tensors once
     x_b = torch.from_numpy(x_branch).float() if isinstance(x_branch, np.ndarray) else x_branch.clone()
     x_t = torch.from_numpy(x_trunk).float().to(device) if isinstance(x_trunk, np.ndarray) else x_trunk.to(device)
-    y_tensor = torch.from_numpy(y).float() if isinstance(y, np.ndarray) else y.clone()
-    
     n_samples = x_b.shape[0]
-    n_points = x_t.shape[0]
     
     # Get the actual output dimension (accounts for multi-component outputs like 2D displacement)
     # Do a test forward pass to determine output shape
     with torch.no_grad():
-        test_pred = model.forward(x_b[0:1].to(device), x_t)
+        if model.heteroscedastic:
+            test_pred, test_logvar = model.forward(x_b[0:1].to(device), x_t)
+        else:
+            test_pred = model.forward(x_b[0:1].to(device), x_t)
         n_outputs = test_pred.shape[1]  # Total output dimension (n_points * num_Y_components)
     
     # Initialize diagonal Hessian with prior term
@@ -237,7 +256,8 @@ def compute_diagonal_hessian(model, x_branch, x_trunk, y, noise_std, prior_std, 
     # Scale factor to account for subsampling output points
     # Use n_outputs (actual output dimension) instead of n_points
     scale_factor = n_outputs / sample_points_per_batch
-    noise_var_inv = 1.0 / (noise_std ** 2)
+    if not model.heteroscedastic:
+        noise_var_inv = 1.0 / (noise_std ** 2)
     
     # Process samples in batches
     for i in range(0, n_samples, batch_size):
@@ -250,7 +270,10 @@ def compute_diagonal_hessian(model, x_branch, x_trunk, y, noise_std, prior_std, 
         
         # Forward pass - use forward() instead of predict() to enable gradient computation
         # predict() uses torch.no_grad() which disables gradients
-        pred = model.forward(x_b_batch, x_t)  # [batch_size, n_outputs] where n_outputs = n_points * num_Y_components
+        if model.heteroscedastic:
+            pred, logvar = model.forward(x_b_batch, x_t)  # [batch_size, n_outputs]
+        else:
+            pred = model.forward(x_b_batch, x_t)  # [batch_size, n_outputs] where n_outputs = n_points * num_Y_components
         
         # Process each sample and sampled output point
         batch_size_actual = pred.shape[0]
@@ -258,7 +281,6 @@ def compute_diagonal_hessian(model, x_branch, x_trunk, y, noise_std, prior_std, 
             for idx, k in enumerate(sample_indices):
                 # Zero gradients before backward
                 model.zero_grad()
-                
                 # Compute gradient for this specific output
                 # Use retain_graph only when not at the last iteration
                 is_last = (j == batch_size_actual - 1) and (idx == len(sample_indices) - 1)
@@ -272,11 +294,15 @@ def compute_diagonal_hessian(model, x_branch, x_trunk, y, noise_std, prior_std, 
                     if p.grad is not None:
                         grad_sq_sum[offset:offset + numel] = p.grad.view(-1).pow(2)
                     offset += numel
-                
-                H_diag += grad_sq_sum * noise_var_inv * scale_factor
+                if not model.heteroscedastic:    
+                    H_diag += grad_sq_sum * noise_var_inv * scale_factor
+                else:
+                    inv_var = torch.exp(-logvar[j, k].detach())
+                    H_diag += grad_sq_sum * inv_var * scale_factor
         
         # Explicitly delete tensors to free memory
         del pred, x_b_batch
+        if model.heteroscedastic: del logvar
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
         if (i + batch_size) % 100 == 0 or batch_end == n_samples:
@@ -322,45 +348,70 @@ def uqevaluation(num_test, test_data, model, method, hmc_samples=None, la_sample
         print("Computing posterior predictions...")
         with torch.no_grad():
             preds_eval_list = []
+            if model.heteroscedastic: logvarlst = []
             for idx, s in enumerate(hmc_samples): # pyright: ignore[reportArgumentType]
                 unpack_params(model, s.to(device))
                 x_b = torch.from_numpy(x_branch_eval).float().to(device)
                 x_t = torch.from_numpy(x_trunk_eval).float().to(device)
-                pred = model.predict(x_b, x_t)
+                if model.heteroscedastic:
+                    pred, logvar = model.predict(x_b, x_t)
+                    logvarlst.append(logvar.detach().cpu().numpy())
+                else:
+                    pred = model.predict(x_b, x_t)
                 preds_eval_list.append(pred.cpu().numpy())
         preds_eval = np.stack(preds_eval_list)
+        if model.heteroscedastic: logvars = np.stack(logvarlst)
     elif method == 'mcd':    
         # Compute MC Dropout predictions
         print("Computing MC Dropout predictions...")
         preds_eval_list = []
+        if model.heteroscedastic: logvarlst = []
         with torch.no_grad():
             for i in range(epoch_mcd):
                 x_b = torch.from_numpy(x_branch_eval).float().to(device)
                 x_t = torch.from_numpy(x_trunk_eval).float().to(device)
-                pred = model.forward(x_b, x_t)
+                if model.heteroscedastic:
+                    pred, logvar = model.forward(x_b, x_t)
+                    logvarlst.append(logvar.detach().cpu().numpy())
+                else:
+                    pred = model.forward(x_b, x_t)
                 preds_eval_list.append(pred.cpu().numpy())
         preds_eval = np.stack(preds_eval_list)
+        if model.heteroscedastic: logvars = np.stack(logvarlst)
     elif method == 'la':
         # Compute Laplace predictions for evaluation set
         print("Computing Laplace posterior predictions...")
         preds_eval_list = []
+        if model.heteroscedastic: logvarlst = []
         with torch.no_grad():
             for idx, s in enumerate(la_samples): # pyright: ignore[reportArgumentType]
                 unpack_params(model, s.to(device))
                 x_b = torch.from_numpy(x_branch_eval).float().to(device)
                 x_t = torch.from_numpy(x_trunk_eval).float().to(device)
-                pred = model.predict(x_b, x_t)
+                if model.heteroscedastic:
+                    pred, logvar = model.predict(x_b, x_t)
+                    logvarlst.append(logvar.detach().cpu().numpy())
+                else:
+                    pred = model.predict(x_b, x_t)
                 preds_eval_list.append(pred.cpu().numpy())
         preds_eval = np.stack(preds_eval_list)
+        if model.heteroscedastic: logvars = np.stack(logvarlst)
+    else:
+        raise ValueError("Invalid method for uncertainty evaluation. Choose from 'hmc', 'mcd', or 'la'.")
 
     # Compute uncertainties
     mean_pred_eval = preds_eval.mean(axis=0)
     epistemic_var_eval = preds_eval.var(axis=0)
-    epistemic_std_eval = np.sqrt(epistemic_var_eval)
-    aleatoric_var_eval = noise_std ** 2
+    if model.heteroscedastic:
+        aleatoric_var_eval = np.exp(logvars).mean(axis=0)
+    else:
+        aleatoric_var_eval = noise_std ** 2
     total_var_eval = epistemic_var_eval + aleatoric_var_eval
     total_std_eval = np.sqrt(total_var_eval)
-    sample_std = np.mean(epistemic_std_eval, axis=1)
+    if model.heteroscedastic:
+        sample_std = np.mean(total_std_eval, axis=1)
+    else:
+        sample_std = np.mean(np.sqrt(epistemic_var_eval), axis=1)
 
     # PREDICTION ERROR
     errors = y_eval - mean_pred_eval
@@ -476,129 +527,4 @@ def run_regression_shift(method, levels, results):
         if i == 0: ax.legend()
         
     plt.tight_layout()
-    plt.show()
-
-def plot_uq(num_test, test_data, model, data, method, hmc_samples=None, lasamples=None):
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    noise_std = 0.05
-    # Define visualization parameters
-    num_vis_samples = 5  # Number of samples to visualize
-    vis_indices = np.random.choice(num_test, num_vis_samples, replace=False)
-
-    # Get visualization data
-    x_branch_vis = test_data['X_train'][vis_indices]
-    x_trunk_vis = test_data['X_trunk']
-    y_vis = test_data['Y_train'][vis_indices]
-
-    if method == 'hmc':
-        with torch.no_grad():
-            preds_list = []
-            for idx, s in enumerate(hmc_samples): # pyright: ignore[reportArgumentType]
-                unpack_params(model, s.to(device))
-                x_b = torch.from_numpy(x_branch_vis).float().to(device)
-                x_t = torch.from_numpy(x_trunk_vis).float().to(device)
-                pred = model.predict(x_b, x_t)
-                preds_list.append(pred.cpu().numpy())
-        preds = np.stack(preds_list)
-    elif method == 'mcd':
-        # Ensure dropout is enabled
-        inject_dropout(model)
-        torch.nn.Module.train(model)
-        for module in model.modules():
-            if isinstance(module, torch.nn.Dropout):
-                torch.nn.Module.train(module)        
-        # Compute MC Dropout predictions
-        preds_list = []
-        with torch.no_grad():
-            for i in range(num_vis_samples):
-                x_b = torch.from_numpy(x_branch_vis).float().to(device)
-                x_t = torch.from_numpy(x_trunk_vis).float().to(device)
-                pred = model.predict(x_b, x_t)
-                preds_list.append(pred.cpu().numpy())
-        preds = np.stack(preds_list)
-    elif method == 'la':
-        # Compute Laplace predictions for visualization set
-        preds_list = []
-        with torch.no_grad():
-            for idx, s in enumerate(lasamples): # pyright: ignore[reportArgumentType]
-                unpack_params(model, s.to(device))
-                x_b = torch.from_numpy(x_branch_vis).float().to(device)
-                x_t = torch.from_numpy(x_trunk_vis).float().to(device)
-                pred = model.predict(x_b, x_t)
-                preds_list.append(pred.cpu().numpy())
-        preds = np.stack(preds_list)
-    else:
-        raise ValueError("Invalid method for UQ plotting")
-    
-    if preds is None:
-        raise ValueError("Predictions not computed for UQ plotting")
-    mean_pred_vis = preds.mean(axis=0)
-    epistemic_var_vis = preds.var(axis=0)
-    epistemic_std_vis = np.sqrt(epistemic_var_vis)
-    aleatoric_std_vis = noise_std * np.ones_like(mean_pred_vis)
-    total_std_vis = np.sqrt(epistemic_var_vis + noise_std**2)
-
-    print(f"Predictions shape: {preds.shape}")
-
-    # Set up plotting
-    rows = num_vis_samples
-    cols = 7  # m, u_true, u_mean, σ_epistemic, σ_aleatoric, σ_total, error
-    fs = 14
-
-    fig, axs = plt.subplots(rows, cols, figsize=(28, 4*rows))
-
-    nodes = data.X_trunk
-    u_tags = [r'$m$ (input)', r'$u_{true}$', r'$u_{mean}$', 
-                r'$\sigma_{epistemic}$', r'$\sigma_{aleatoric}$', 
-                r'$\sigma_{total}$', r'$|u_{true} - u_{mean}|$']
-    cmaps = ['jet', 'viridis', 'viridis', 'plasma', 'plasma', 'plasma', 'hot']
-
-    for i in range(rows):
-        # Get data
-        i_m = x_branch_vis[i]
-        i_truth = y_vis[i]
-        i_mean = mean_pred_vis[i]
-        i_epistemic = epistemic_std_vis[i]
-        i_aleatoric = aleatoric_std_vis[i]
-        i_total = total_std_vis[i]
-
-        i_m = data.decoder_X(i_m)
-        i_truth = data.decoder_Y(i_truth)
-        i_mean_decoded = data.decoder_Y(i_mean)
-        scale_factor = data.std_Y if hasattr(data, 'std_Y') else 1.0
-        i_epistemic_scaled = i_epistemic * scale_factor
-        i_aleatoric_scaled = i_aleatoric * scale_factor
-        i_total_scaled = i_total * scale_factor
-        
-        # Apply Dirichlet BC
-        def apply_dirichlet_bc(u, bc_value, bc_node_ids):
-            u[bc_node_ids] = bc_value
-            return u
-        i_mean_decoded = apply_dirichlet_bc(i_mean_decoded.copy(), 0.0, data.u_mesh_dirichlet_boundary_nodes)
-        
-        i_error = np.abs(i_truth - i_mean_decoded)
-        rel_error = np.linalg.norm(i_error) / np.linalg.norm(i_truth)
-        
-        uvec = [i_m, i_truth, i_mean_decoded, i_epistemic_scaled, 
-                    i_aleatoric_scaled, i_total_scaled, i_error]
-        
-        for j in range(cols):
-            cbar = field_plot(axs[i,j], uvec[j], nodes, cmap=cmaps[j])
-            
-            divider = make_axes_locatable(axs[i,j])
-            cax = divider.append_axes('right', size='8%', pad=0.03)
-            cax.tick_params(labelsize=fs-4)
-            
-            kfmt = lambda x, pos: "{:.2g}".format(x)
-            fig.colorbar(cbar, cax=cax, orientation='vertical', format=kfmt)
-            
-            if i == 0:
-                axs[i,j].set_title(u_tags[j], fontsize=fs)
-            
-            if j == cols - 1:
-                axs[i,j].set_title(f'rel err: {rel_error*100:.2f}%', fontsize=fs-2)
-            
-            axs[i,j].axis('off')
-
-    fig.tight_layout()
     plt.show()

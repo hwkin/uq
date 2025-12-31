@@ -9,16 +9,16 @@ from torch.utils.data import DataLoader
 # local utility methods
 src_path = '../../'
 sys.path.append(src_path + 'data/')
-from dataMethods import DataHandler
+from dataMethods import DataHandler # pyright: ignore[reportMissingImports]
 
 sys.path.append(src_path + 'nn/mlp/')
-from torch_mlp import MLP
+from torch_mlp import MLP # pyright: ignore[reportMissingImports]
 
 class PCANet(nn.Module):
     
     def __init__(self, num_layers, num_neurons, act, \
                  num_inp_red_dim, num_out_red_dim, save_file=None,
-                 dropout=False, dropout_rate=0.1):
+                 dropout=False, dropout_rate=0.1, heteroscedastic=False):
 
         super(PCANet, self).__init__()
         self.name = 'PCANet'
@@ -35,10 +35,14 @@ class PCANet(nn.Module):
         self.dropout = dropout
         self.dropout_rate = dropout_rate
 
+        # heteroscedastic flag
+        self.heteroscedastic = heteroscedastic
+        self.effective_br_outputs = num_out_red_dim * (2 if heteroscedastic else 1)
+
         # network
         self.net = MLP(input_size=num_inp_red_dim, \
                               hidden_size=num_neurons, \
-                              num_classes=num_out_red_dim, \
+                              num_classes=self.effective_br_outputs, \
                               depth=num_layers, \
                               act=act,
                               dropout=dropout,
@@ -61,6 +65,11 @@ class PCANet(nn.Module):
 
     def forward(self, X):
         X = self.convert_np_to_tensor(X)
+        if self.heteroscedastic:
+            out = self.net.forward(X)
+            mean_out = out[:, :self.effective_br_outputs//2]
+            logvar_out = out[:, self.effective_br_outputs//2:]
+            return mean_out, logvar_out
         return self.net.forward(X)
     
     def train(self, train_data, test_data, \
@@ -87,8 +96,14 @@ class PCANet(nn.Module):
                                      batch_size=batch_size, shuffle=True)
 
         # loss and optimizer setup
-        criterion = nn.MSELoss()
-        optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=1e-4)
+        if self.heteroscedastic:
+            # Negative Log Likelihood for Gaussian
+            criterion = nn.GaussianNLLLoss()
+            print("Training with Heteroscedastic Aleatoric Uncertainty (GaussianNLLLoss).")
+        else:
+            criterion = nn.MSELoss()
+            print("Training with Homoscedastic assumption (MSELoss).")
+        optimizer = optim.AdamW(self.parameters(), lr=lr, weight_decay=1e-4)
         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
 
         self.train_loss_log = np.zeros((epochs, 1))
@@ -121,7 +136,12 @@ class PCANet(nn.Module):
                 optimizer.zero_grad()
 
                 # forward pass through model
-                Y_train_pred = self.forward(X_train)
+                if self.heteroscedastic:
+                    Y_train_pred_mean, Y_train_pred_logvar = self.forward(X_train)
+                    loss = criterion(Y_train_pred_mean, Y_train, torch.exp(Y_train_pred_logvar))
+                else:
+                    Y_train_pred = self.forward(X_train)
+                    loss = criterion(Y_train_pred, Y_train)
 
                 # compute and save loss
                 loss = criterion(Y_train_pred, Y_train)
@@ -145,10 +165,12 @@ class PCANet(nn.Module):
                     Y_test = Y_test.to(self.device)
 
                     # forward pass through model
-                    Y_test_pred = self.forward(X_test)
-
-                    # compute and save test loss
-                    test_loss = criterion(Y_test_pred, Y_test)
+                    if self.heteroscedastic:
+                        Y_train_test_mean, Y_train_test_logvar = self.forward(X_test)
+                        test_loss = criterion(Y_train_test_mean, Y_test, torch.exp(Y_train_test_logvar))
+                    else:
+                        Y_test_pred = self.forward(X_test)
+                        test_loss = criterion(Y_test_pred, Y_test)
                     test_losses.append(test_loss.item())
 
             # log losses
@@ -160,10 +182,11 @@ class PCANet(nn.Module):
             epoch_time = t2 - t1
 
             if log == True and (epoch % loss_print_freq == 0 or epoch == epochs or epoch == 1):
+                loss_label = "NLL" if self.heteroscedastic else "L2 squared"
                 print('-'*50)
-                print('Epoch: {:5d}, Train Loss (l2 squared): {:.3e}, Test Loss (l2 squared): {:.3e}, Time (sec): {:.3f}'.format(epoch, \
-                                    np.mean(self.train_loss_log[epoch-1, 0]), \
-                                    np.mean(self.test_loss_log[epoch-1, 0]), \
+                print('Epoch: {:5d}, Train Loss ({}}): {:.3e}, Test Loss ({}}): {:.3e}, Time (sec): {:.3f}'.format(epoch, \
+                                    loss_label, np.mean(self.train_loss_log[epoch-1, 0]), \
+                                    loss_label, np.mean(self.test_loss_log[epoch-1, 0]), \
                                     epoch_time))
                 print('-'*50)
 
@@ -177,10 +200,10 @@ class PCANet(nn.Module):
         # print final message
         end_time = time.perf_counter()
         print('-'*50)
-        print('Train time: {:.3f}, Epochs: {:5d}, Batch Size: {:5d}, Final Train Loss (l2 squared): {:.3e}, Final Test Loss (l2 squared): {:.3e}'.format(end_time - start_time, \
+        print('Train time: {:.3f}, Epochs: {:5d}, Batch Size: {:5d}, Final Train Loss ({}}): {:.3e}, Final Test Loss ({}}): {:.3e}'.format(end_time - start_time, \
                     epochs, batch_size, \
-                    self.train_loss_log[-1, 0], \
-                    self.test_loss_log[-1, 0]))
+                    loss_label, self.train_loss_log[-1, 0], \
+                    loss_label, self.test_loss_log[-1, 0]))
         print('-'*50)
     
     def predict(self, X):
