@@ -50,7 +50,7 @@ def make_log_prob_fn(model, x_branch, x_trunk, y, noise_std=0.01, prior_std=1.0)
 
     def log_prob(flat_params):
         unpack_params(model, flat_params)
-        pred = model.predict(x_branch, x_trunk)  # DeepONet predict method
+        pred = model.forward(x_branch, x_trunk)  # Use forward to keep gradients
         resid = (y - pred).reshape(y.shape[0], -1)
         # Log-likelihood (Gaussian)
         ll = -0.5 * (resid.pow(2).sum() / (noise_std**2))

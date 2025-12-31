@@ -1,7 +1,5 @@
 {
-    "python.analysis.extraPaths": [
-        "./src/nn/deeponet",
-        "./src/data",
-        "./src/plotting"
-    ]
+    "python.languageServer": "Jedi",
+    "python.analysis.indexing": true,
+    "python.analysis.diagnosticMode": "openFilesOnly"
 }
