@@ -167,3 +167,7 @@ src/prior/test_prior_sampler/
 
 *.html
 *.Identifier
+
+bayesian_inverse_problem_possion/
+src/nn/mcmc/
+.vscode/
