@@ -9,7 +9,7 @@ def compute_metric(preds_eval, noise_std, y_eval):
     aleatoric_var_eval = noise_std ** 2
     total_var_eval = epistemic_var_eval + aleatoric_var_eval
     total_std_eval = np.sqrt(total_var_eval)
-    sample_std = np.mean(epistemic_std_eval, axis=1)
+    sample_std = np.max(epistemic_std_eval, axis=1)
 
     # PREDICTION ERROR
     errors = y_eval - mean_pred_eval
@@ -50,10 +50,10 @@ def comparison_uq(result_lst, method_lst):
         comparison_data[method] = [f"{rmse:.4f}", f"{cov1:.2f}", f"{cov2:.2f}", f"{cov3:.2f}", f"{mpiw:.4f}", f"{nll:.4f}"]
 
     # Print comparison table
-    print("\n{:<25} {:>12} {:>12} {:>12} {:>10}".format('Metric', *results.keys(), 'Ideal'))
+    print("\n{:<25} {:>12} {:>12} {:>12} {:>12} {:>10}".format('Metric', *results.keys(), 'Ideal'))
     print("-" * 85)
     for i in range(len(comparison_data['Metric'])):
-        print("{:<25} {:>12} {:>12} {:>12} {:>10}".format(
+        print("{:<25} {:>12} {:>12} {:>12} {:>12} {:>10}".format(
             comparison_data['Metric'][i],
             *(comparison_data[method][i] for method in results.keys()),
             comparison_data['Ideal'][i]
