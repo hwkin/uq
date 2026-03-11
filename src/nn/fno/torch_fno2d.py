@@ -81,9 +81,9 @@ class FNO2D(nn.Module):
         # rearrange x so that it has the shape (batch, width, x, y)
         x = x.permute(0, 3, 1, 2)
         
-        # pass through hidden layers
-        for i in range(self.num_layers):
-            x = self.fno_layers[i](x)
+        # pass through hidden layers (includes optional inserted dropout modules)
+        for layer in self.fno_layers:
+            x = layer(x)
         
         # rearrange x so that it has the shape (batch, x, y, width)
         x = x.permute(0, 2, 3, 1)
@@ -204,9 +204,9 @@ class FNO2D(nn.Module):
             # check if we need to save model parameters
             if save_model == True and (epoch % save_epoch == 0 or epoch == epochs):
                 torch.save(self, self.save_file)
-                print('-'*50)
-                print('Model parameters saved at epoch {}'.format(epoch))
-                print('-'*50)
+                # print('-'*50)
+                # print('Model parameters saved at epoch {}'.format(epoch))
+                # print('-'*50)
 
         # print final message
         end_time = time.perf_counter()

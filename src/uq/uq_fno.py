@@ -2,9 +2,11 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+import copy
 import hamiltorch
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 import sys
 sys.path.append(".")
 import uq_evaluation
@@ -136,6 +138,101 @@ def _coerce_positive_scalar(value, name: str) -> float:
     if not np.isfinite(value) or value <= 0.0:
         raise ValueError(f"{name} must be a finite positive scalar; got {value}")
     return value
+
+
+_HMC_SUBSET_ALIASES = {
+    "all": "all",
+    "full": "all",
+    "full_layer": "all",
+    "all_params": "all",
+    "all_parameters": "all",
+    "real_all": "real_all",
+    "real": "real_all",
+    "projectors": "projectors",
+    "proj": "projectors",
+    "head": "projectors",
+    "last_layer": "last_layer",
+    "last-layer": "last_layer",
+    "last": "last_layer",
+    "output_projector": "last_layer",
+}
+
+
+_LA_SUBSET_ALIASES = {
+    "real_all": "real_all",
+    "all": "real_all",
+    "full": "real_all",
+    "full_layer": "real_all",
+    "all_params": "real_all",
+    "all_parameters": "real_all",
+    "projectors": "projectors",
+    "proj": "projectors",
+    "head": "projectors",
+    "last_layer": "last_layer",
+    "last-layer": "last_layer",
+    "last": "last_layer",
+    "output_projector": "last_layer",
+}
+
+
+def _normalize_hmc_subset_of_weights(subset_of_weights):
+    key = str(subset_of_weights).strip().lower()
+    if key not in _HMC_SUBSET_ALIASES:
+        raise ValueError(
+            f"Unsupported HMC subset_of_weights='{subset_of_weights}'. "
+            "Use one of: 'all', 'real_all', 'projectors', 'last_layer'."
+        )
+    return _HMC_SUBSET_ALIASES[key]
+
+
+def _normalize_la_subset_of_weights(subset_of_weights):
+    key = str(subset_of_weights).strip().lower()
+    if key not in _LA_SUBSET_ALIASES:
+        raise ValueError(
+            f"Unsupported Laplace subset_of_weights='{subset_of_weights}'. "
+            "Use one of: 'real_all', 'projectors', 'last_layer'."
+        )
+    return _LA_SUBSET_ALIASES[key]
+
+
+def _set_requires_grad_subset_fno(model, subset_key):
+    """
+    Configure trainable parameters for a selected FNO subset.
+
+    Returns:
+        mode: "all" (includes complex params) or "real_only"
+    """
+    for p in model.parameters():
+        p.requires_grad = False
+
+    if subset_key == "all":
+        for p in model.parameters():
+            p.requires_grad = True
+        return "all"
+
+    if subset_key == "real_all":
+        for p in model.parameters():
+            if not p.is_complex():
+                p.requires_grad = True
+        return "real_only"
+
+    if subset_key == "projectors":
+        if not hasattr(model, "input_projector") or not hasattr(model, "output_projector"):
+            raise AttributeError("FNO model is missing input/output projectors.")
+        for p in model.input_projector.parameters():
+            p.requires_grad = True
+        for p in model.output_projector.parameters():
+            p.requires_grad = True
+        return "real_only"
+
+    if subset_key == "last_layer":
+        if not hasattr(model, "output_projector"):
+            raise AttributeError("FNO model has no output_projector.")
+        for p in model.output_projector.parameters():
+            p.requires_grad = True
+        return "real_only"
+
+    raise ValueError(f"Unknown subset key '{subset_key}'")
 
 
 def _output_projector_params(model):
@@ -589,6 +686,407 @@ def hmc_nuts(model, X, y, num_samples=1000, burn_in=1000, step_size=1e-4, num_st
     full_samples = torch.stack(full_samples)
     return full_samples
 
+
+def fit_hmc_torch(
+    model,
+    X,
+    y,
+    noise_std=0.2,
+    subset_of_weights="projectors",
+    prior_std=None,
+    initial_step_size=1e-4,
+    leapfrog_steps=20,
+    num_samples=1000,
+    burn_in=1000,
+    random_seed=42,
+    batch_size=None,
+    reduce_output_mean=True,
+):
+    """
+    Run HMC sampling for FNO and return full parameter vectors.
+
+    Important note for FNO:
+      - subset='all' samples all parameters, including complex Fourier weights
+        represented via concatenated real/imag parts.
+      - subset in {'real_all', 'projectors', 'last_layer'} samples only a real-valued
+        subset and reconstructs full vectors with complex weights fixed at MAP values.
+    """
+    torch.manual_seed(random_seed)
+    np.random.seed(random_seed)
+    hamiltorch.set_random_seed(random_seed)
+
+    device = next(model.parameters()).device
+    model_for_hmc = copy.deepcopy(model).to(device)
+    base_state = {k: v.detach().clone() for k, v in model_for_hmc.state_dict().items()}
+
+    subset_key = _normalize_hmc_subset_of_weights(subset_of_weights)
+    mode = _set_requires_grad_subset_fno(model_for_hmc, subset_key)
+
+    if mode == "all":
+        flat0 = pack_params(model_for_hmc).to(device)
+        empirical_prior_std = float(torch.std(flat0).detach().cpu().item()) if flat0.numel() > 1 else 1.0
+        prior_std_eff = max(float(prior_std) if prior_std is not None else empirical_prior_std, 1e-12)
+        log_prob = make_log_prob_fn(
+            model_for_hmc,
+            X,
+            y,
+            noise_std=noise_std,
+            prior_std=prior_std_eff,
+            batch_size=batch_size,
+            reduce_output_mean=reduce_output_mean,
+            real_params_only=False,
+        )
+        reconstruct_full = False
+        real_meta = None
+        print(
+            "Preparing full-parameter HMC (complex-safe split real/imag): "
+            f"n_trainable={flat0.numel()}, empirical_prior_std={empirical_prior_std:.3e}, "
+            f"effective_prior_std={prior_std_eff:.3e}"
+        )
+    else:
+        real_meta = _real_param_metadata(model_for_hmc)
+        if not real_meta:
+            raise ValueError("Selected HMC subset has zero real-valued trainable parameters.")
+        flat0 = pack_real_params(real_meta).to(device)
+        empirical_prior_std = float(torch.std(flat0).detach().cpu().item()) if flat0.numel() > 1 else 1.0
+        prior_std_eff = max(float(prior_std) if prior_std is not None else empirical_prior_std, 1e-12)
+        log_prob = make_log_prob_fn(
+            model_for_hmc,
+            X,
+            y,
+            noise_std=noise_std,
+            prior_std=prior_std_eff,
+            batch_size=batch_size,
+            reduce_output_mean=reduce_output_mean,
+            real_params_only=True,
+            real_meta=real_meta,
+        )
+        reconstruct_full = True
+        print(
+            f"Preparing subset HMC ({subset_key}): "
+            f"n_trainable_real={flat0.numel()}, empirical_prior_std={empirical_prior_std:.3e}, "
+            f"effective_prior_std={prior_std_eff:.3e}"
+        )
+
+    sampled_list = hamiltorch.sample(
+        log_prob_func=log_prob,
+        params_init=flat0.requires_grad_(True),
+        num_samples=num_samples,
+        burn=burn_in,
+        step_size=initial_step_size,
+        num_steps_per_sample=leapfrog_steps,
+        sampler=hamiltorch.Sampler.HMC_NUTS,
+    )
+    sampled = torch.stack(sampled_list)
+
+    if not reconstruct_full:
+        return sampled.detach().cpu()
+
+    full_samples = []
+    for s in sampled:
+        full_samples.append(
+            build_full_vector_from_real_sample(
+                model_for_hmc,
+                real_meta, # type: ignore[arg-type]
+                s.detach(),
+                base_state=base_state,
+            )
+        )
+    return torch.stack(full_samples, dim=0)
+
+
+def _collect_swag_snapshot(model, swag_state, max_rank):
+    """Update SWAG running statistics with the current full-parameter snapshot."""
+    w = pack_all_params(model).detach().cpu()
+
+    if swag_state["n_models"] == 0:
+        swag_state["mean"] = w.clone()
+        swag_state["sq_mean"] = w.pow(2)
+        swag_state["n_models"] = 1
+        return
+
+    n_old = swag_state["n_models"]
+    n_new = n_old + 1
+    mean_old = swag_state["mean"]
+    sq_mean_old = swag_state["sq_mean"]
+
+    mean_new = mean_old + (w - mean_old) / n_new
+    sq_mean_new = sq_mean_old + (w.pow(2) - sq_mean_old) / n_new
+
+    swag_state["mean"] = mean_new
+    swag_state["sq_mean"] = sq_mean_new
+    swag_state["n_models"] = n_new
+
+    dev = w - mean_new
+    swag_state["deviations"].append(dev)
+    if len(swag_state["deviations"]) > max_rank:
+        swag_state["deviations"].pop(0)
+
+
+def fit_swag(
+    model,
+    train_data,
+    swag_lr=5e-5,
+    swag_epochs=50,
+    batch_size=20,
+    weight_decay=1e-4,
+    momentum=0.9,
+    collect_freq=1,
+    start_collect_epoch=10,
+    max_rank=20,
+    random_seed=42,
+    log_every=10,
+):
+    """
+    Fit SWAG statistics for FNO by fine-tuning MAP weights with SGD and
+    collecting full-parameter snapshots.
+    """
+    torch.manual_seed(random_seed)
+    np.random.seed(random_seed)
+    device = next(model.parameters()).device
+
+    x_train = train_data["X_train"]
+    y_train = train_data["Y_train"]
+
+    if isinstance(x_train, np.ndarray):
+        x_train = torch.from_numpy(x_train).float()
+    else:
+        x_train = x_train.float().detach().cpu()
+    if isinstance(y_train, np.ndarray):
+        y_train = torch.from_numpy(y_train).float()
+    else:
+        y_train = y_train.float().detach().cpu()
+
+    dataset = TensorDataset(x_train, y_train)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=swag_lr,
+        momentum=momentum,
+        weight_decay=weight_decay,
+    )
+    criterion = nn.MSELoss()
+
+    swag_state = {
+        "mean": None,
+        "sq_mean": None,
+        "deviations": [],
+        "n_models": 0,
+        "max_rank": max_rank,
+        "swag_lr": swag_lr,
+    }
+
+    print("Starting SWAG trajectory collection...")
+    print(f"  Epochs: {swag_epochs}, Batch size: {batch_size}, LR: {swag_lr:.2e}")
+    print(f"  Collect from epoch {start_collect_epoch} every {collect_freq} epoch(s), max rank: {max_rank}")
+
+    nn.Module.train(model, True)
+    for epoch in range(1, swag_epochs + 1):
+        batch_losses = []
+        for xb, yb in dataloader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+
+            optimizer.zero_grad()
+            pred = model.forward(xb)
+            loss = criterion(pred, yb)
+            loss.backward()
+            optimizer.step()
+            batch_losses.append(loss.item())
+
+        if epoch >= start_collect_epoch and ((epoch - start_collect_epoch) % collect_freq == 0):
+            _collect_swag_snapshot(model, swag_state, max_rank=max_rank)
+
+        if epoch == 1 or epoch == swag_epochs or epoch % log_every == 0:
+            mean_loss = float(np.mean(batch_losses)) if batch_losses else float("nan")
+            print(f"  Epoch {epoch:4d}/{swag_epochs}: train loss = {mean_loss:.4e}, collected = {swag_state['n_models']}")
+
+    if swag_state["n_models"] == 0:
+        raise RuntimeError("SWAG collected zero snapshots. Reduce start_collect_epoch or collect_freq.")
+
+    if len(swag_state["deviations"]) > 0:
+        swag_state["cov_mat_sqrt"] = torch.stack(swag_state["deviations"], dim=0)
+    else:
+        n_params = swag_state["mean"].numel()
+        swag_state["cov_mat_sqrt"] = torch.empty((0, n_params), dtype=swag_state["mean"].dtype)
+    del swag_state["deviations"]
+
+    print(f"SWAG collection finished with {swag_state['n_models']} snapshots.")
+    return swag_state
+
+
+def sample_swag_posterior(
+    swag_state,
+    num_samples=30,
+    scale=1.0,
+    diag_only=False,
+    var_clamp=1e-30,
+    device=None,
+):
+    """
+    Draw full-parameter samples from the SWAG Gaussian posterior approximation.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    mean = swag_state["mean"].to(device)
+    sq_mean = swag_state["sq_mean"].to(device)
+    cov_mat_sqrt = swag_state["cov_mat_sqrt"].to(device)
+
+    diag_var = torch.clamp(sq_mean - mean.pow(2), min=var_clamp)
+    diag_std = torch.sqrt(diag_var)
+
+    samples = []
+    diag_scale = np.sqrt(scale / 2.0)
+    for _ in range(num_samples):
+        z_diag = torch.randn_like(mean)
+        sample = mean + diag_scale * diag_std * z_diag
+
+        if (not diag_only) and cov_mat_sqrt.numel() > 0:
+            k = cov_mat_sqrt.shape[0]
+            if k > 1:
+                z_low_rank = torch.randn(k, device=device)
+                low_rank = cov_mat_sqrt.t().matmul(z_low_rank) / np.sqrt(k - 1.0)
+                sample = sample + diag_scale * low_rank
+
+        samples.append(sample.detach().cpu())
+
+    return torch.stack(samples, dim=0)
+
+
+class _FNOWrapper(nn.Module):
+    """
+    Adapter for laplace-torch: exposes FNO as a single-input regression model
+    with flattened outputs and a PyTorch-compatible train(mode) toggle.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x):
+        pred = self.model.forward(x)
+        return pred.reshape(pred.shape[0], -1)
+
+    @staticmethod
+    def _set_training_flag(module, mode):
+        module.training = mode
+        for child in module.children():
+            _FNOWrapper._set_training_flag(child, mode)
+
+    def train(self, mode=True):
+        if not isinstance(mode, bool):
+            raise ValueError("training mode is expected to be boolean")
+        self.training = mode
+        self._set_training_flag(self.model, mode)
+        return self
+
+
+def fit_laplace_torch(
+    model,
+    X,
+    y,
+    batch_size=1,
+    noise_std=0.2,
+    prior_precision=1.0,
+    subset_of_weights="projectors",
+    hessian_structure="diag",
+    random_seed=42,
+):
+    """
+    Fit Laplace posterior for FNO with laplace-torch on real-valued subsets only.
+
+    Supported subsets:
+      - 'real_all': all non-complex trainable parameters
+      - 'projectors': input + output projector layers
+      - 'last_layer': output projector only
+    """
+    try:
+        from laplace import Laplace
+    except ImportError as exc:
+        raise ImportError(
+            "laplace-torch is not installed. Install with `pip install laplace-torch`."
+        ) from exc
+
+    torch.manual_seed(random_seed)
+    np.random.seed(random_seed)
+
+    subset_key = _normalize_la_subset_of_weights(subset_of_weights)
+    device = next(model.parameters()).device
+
+    if isinstance(X, np.ndarray):
+        X = torch.from_numpy(X).float()
+    else:
+        X = X.float()
+    if isinstance(y, np.ndarray):
+        y = torch.from_numpy(y).float()
+    else:
+        y = y.float()
+
+    X = X.to(device)
+    y = y.reshape(y.shape[0], -1).to(device)
+
+    model_for_laplace = copy.deepcopy(model).to(device)
+    base_state = {k: v.detach().clone() for k, v in model_for_laplace.state_dict().items()}
+
+    _set_requires_grad_subset_fno(model_for_laplace, subset_key)
+    real_meta = _real_param_metadata(model_for_laplace)
+    if not real_meta:
+        raise ValueError("Selected Laplace subset has zero real-valued trainable parameters.")
+
+    wrapped_model = _FNOWrapper(model_for_laplace)
+    dataset = TensorDataset(X, y)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    print("Fitting Laplace posterior with laplace-torch...")
+    if isinstance(prior_precision, torch.Tensor):
+        prior_precision_print = float(prior_precision.detach().cpu().item())
+    else:
+        prior_precision_print = float(prior_precision)
+    print(f"  subset_of_weights={subset_of_weights} (effective={subset_key}), hessian_structure={hessian_structure}")
+    print(f"  batch_size={batch_size}, sigma_noise={noise_std:.3e}, prior_precision={prior_precision_print:.3e}")
+
+    la = Laplace(
+        wrapped_model,
+        likelihood="regression",
+        subset_of_weights="all",
+        hessian_structure=hessian_structure,
+        sigma_noise=noise_std,
+        prior_precision=prior_precision,
+    )
+    la.fit(loader)
+
+    la._uq_model_ref = model_for_laplace
+    la._uq_base_state = base_state
+    la._uq_real_meta = real_meta
+    la._uq_subset_key = subset_key
+    return la
+
+
+def sample_laplace_torch(la, num_samples=50):
+    """
+    Sample full-parameter vectors from a fitted FNO Laplace posterior.
+    """
+    samples = la.sample(num_samples)
+    model_ref = la._uq_model_ref
+    base_state = la._uq_base_state
+    real_meta = la._uq_real_meta
+    device = next(model_ref.parameters()).device
+
+    full_samples = []
+    for s in samples:
+        full_samples.append(
+            build_full_vector_from_real_sample(
+                model_ref,
+                real_meta,
+                s.to(device),
+                base_state=base_state,
+            )
+        )
+    return torch.stack(full_samples, dim=0)
+
+
 def inject_dropout(model, target_layer_type=nn.Linear, dropout_rate=0.1):
     """
     Recursively adds a Dropout layer after every occurrence of `target_layer_type`.
@@ -783,76 +1281,178 @@ def compute_diagonal_hessian(model, X, y, noise_std, prior_std, device,
     return H_diag
 
 
-def uqevaluation(num_test, test_data, model, method, hmc_samples=None, sgld_samples=None, la_samples=None, model_ensemble=None):
-    noise_std=0.2
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    eval_indices = np.random.choice(len(test_data["X_train"]), num_test, replace=False)
-    eval_indices.sort()
-    epoch_mcd = 100
+def _subsample_draws(draws, max_draws):
+    """Uniformly subsample posterior draws while preserving endpoints."""
+    if max_draws is None:
+        return draws
+    max_draws = int(max_draws)
+    if max_draws <= 0:
+        raise ValueError("max_posterior_samples must be positive when provided.")
+    if len(draws) <= max_draws:
+        return draws
+    idx = np.linspace(0, len(draws) - 1, max_draws, dtype=int)
+    if isinstance(draws, torch.Tensor):
+        return draws[idx]
+    return [draws[i] for i in idx]
 
-    if torch.is_tensor(test_data["X_train"]):
-        X_test_tensor = test_data["X_train"].clone().detach().to(device)
-        X_test_tensor = X_test_tensor[eval_indices]
-    else:
-        X_test_tensor = torch.from_numpy(test_data["X_train"]).float().to(device)
-        X_test_tensor = X_test_tensor[eval_indices]
-    y_eval = test_data['Y_train'].detach().cpu().numpy()
-    y_eval = y_eval.reshape(y_eval.shape[0], -1)
-    y_eval = y_eval[eval_indices]
+
+def _resolve_eval_indices(eval_indices, dataset_size):
+    """Support both explicit index arrays and legacy integer sample-count input."""
+    if np.isscalar(eval_indices):
+        num_test = int(eval_indices)
+        if num_test <= 0:
+            raise ValueError("num_test must be positive.")
+        n_take = min(num_test, dataset_size)
+        idx = np.random.choice(dataset_size, n_take, replace=False)
+        idx.sort()
+        return idx
+
+    idx = np.asarray(eval_indices, dtype=int).reshape(-1)
+    if idx.size == 0:
+        raise ValueError("eval_indices must not be empty.")
+    if np.any(idx < 0) or np.any(idx >= dataset_size):
+        raise IndexError(
+            f"eval_indices out of range: valid=[0, {dataset_size - 1}], got min={idx.min()}, max={idx.max()}."
+        )
+    return idx
+
+
+def _take_rows(arr, idx):
+    if isinstance(arr, np.ndarray):
+        return arr[idx]
+    if torch.is_tensor(arr):
+        idx_t = torch.as_tensor(idx, dtype=torch.long, device=arr.device)
+        return arr.index_select(0, idx_t)
+    arr_np = np.asarray(arr)
+    return arr_np[idx]
+
+
+def _to_tensor_float(x, device):
+    if isinstance(x, np.ndarray):
+        return torch.from_numpy(x).float().to(device)
+    if torch.is_tensor(x):
+        return x.float().to(device)
+    return torch.as_tensor(x, dtype=torch.float32, device=device)
+
+
+def _to_numpy(x):
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def uqevaluation(
+    eval_indices,
+    test_data,
+    model,
+    method,
+    hmc_samples=None,
+    sgld_samples=None,
+    la_samples=None,
+    swag_samples=None,
+    model_ensemble=None,
+    noise_std=0.2,
+    epoch_mcd=100,
+    max_posterior_samples=None,
+    return_preds=False,
+    flatten_output=False,
+):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    n_total = len(test_data["X_train"])
+    eval_indices = _resolve_eval_indices(eval_indices, n_total)
+
+    X_eval = _take_rows(test_data["X_train"], eval_indices)
+    y_eval = _take_rows(test_data["Y_train"], eval_indices)
+
+    X_test_tensor = _to_tensor_float(X_eval, device)
+    y_eval_np = _to_numpy(y_eval)
+    predictions = []
 
     if method == 'hmc':
-        predictions = []
-        for i in range(hmc_samples.shape[0]): # pyright: ignore[reportOptionalMemberAccess]
-            sample_params = hmc_samples[i] # pyright: ignore[reportOptionalSubscript]
-            apply_sample_vector(model, sample_params)
-            with torch.no_grad():
-                pred = model(X_test_tensor).detach().cpu().numpy()
-                pred = pred.reshape(pred.shape[0], -1)
-                predictions.append(pred)
-        predictions = np.array(predictions)
-
-    elif method == 'sgld':
-        predictions = []
-        for i in range(sgld_samples.shape[0]): # pyright: ignore[reportOptionalMemberAccess]
-            sample_params = sgld_samples[i] # pyright: ignore[reportOptionalSubscript]
-            apply_sample_vector(model, sample_params)
-            with torch.no_grad():
-                pred = model(X_test_tensor).detach().cpu().numpy()
-                pred = pred.reshape(pred.shape[0], -1)
-                predictions.append(pred)
-        predictions = np.array(predictions)
-
-    elif method == 'mcd':
-        predictions = []
-        print("Running MC Dropout sampling...")
-        for i in range(epoch_mcd):
-            with torch.no_grad():
-                pred = model(X_test_tensor).detach().cpu().numpy()
-                pred = pred.reshape(pred.shape[0], -1)
-                predictions.append(pred)
-        predictions = np.array(predictions)
-
-    elif method == 'la':
-        predictions=[]
-        for i in range(la_samples.shape[0]): # pyright: ignore[reportOptionalMemberAccess]
-            sample_params = la_samples[i] # pyright: ignore[reportOptionalSubscript]
-            apply_sample_vector(model, sample_params)
-            with torch.no_grad():
-                pred = model(X_test_tensor).detach().cpu().numpy()
-                pred = pred.reshape(pred.shape[0], -1)
-                predictions.append(pred)
-        predictions = np.array(predictions)
-    elif method == 'de':
-        # Compute Deep Ensemble predictions
-        print("Computing Deep Ensemble predictions...")
-        predictions = []
+        if hmc_samples is None:
+            raise ValueError("hmc_samples must be provided for method='hmc'.")
+        draws = _subsample_draws(hmc_samples, max_posterior_samples)
         with torch.no_grad():
-            for paths in model_ensemble:  # model is a list of paths for models.
-                m = torch.load(paths, weights_only=False).to(device)
-                pred = m(X_test_tensor).detach().cpu().numpy()
-                pred = pred.reshape(pred.shape[0], -1)
+            for sample_params in draws:
+                apply_sample_vector(model, sample_params)
+                pred = model.predict(X_test_tensor).detach().cpu().numpy()
                 predictions.append(pred)
-        predictions = np.array(predictions)
+    elif method == 'sgld':
+        if sgld_samples is None:
+            raise ValueError("sgld_samples must be provided for method='sgld'.")
+        draws = _subsample_draws(sgld_samples, max_posterior_samples)
+        with torch.no_grad():
+            for sample_params in draws:
+                apply_sample_vector(model, sample_params)
+                pred = model.predict(X_test_tensor).detach().cpu().numpy()
+                predictions.append(pred)
+    elif method == 'mcd':
+        with torch.no_grad():
+            for _ in range(epoch_mcd):
+                pred = model.forward(X_test_tensor).detach().cpu().numpy()
+                predictions.append(pred)
+    elif method == 'la':
+        if la_samples is None:
+            raise ValueError("la_samples must be provided for method='la'.")
+        draws = _subsample_draws(la_samples, max_posterior_samples)
+        with torch.no_grad():
+            for sample_params in draws:
+                apply_sample_vector(model, sample_params)
+                pred = model.predict(X_test_tensor).detach().cpu().numpy()
+                predictions.append(pred)
+    elif method == 'swag':
+        if swag_samples is None:
+            raise ValueError("swag_samples must be provided for method='swag'.")
+        draws = _subsample_draws(swag_samples, max_posterior_samples)
+        with torch.no_grad():
+            for sample_params in draws:
+                apply_sample_vector(model, sample_params)
+                pred = model.predict(X_test_tensor).detach().cpu().numpy()
+                predictions.append(pred)
+    elif method == 'de':
+        if model_ensemble is None:
+            raise ValueError("model_ensemble must be provided for method='de'.")
+        with torch.no_grad():
+            for path in model_ensemble:
+                m = torch.load(path, weights_only=False).to(device)
+                pred = m.predict(X_test_tensor).detach().cpu().numpy()
+                predictions.append(pred)
     else:
         raise ValueError(f"Unknown method: {method}")
-    return uq_evaluation.compute_metric(predictions, noise_std, y_eval)
+
+    predictions = np.stack(predictions)
+
+    predictions_flat = predictions.reshape(predictions.shape[0], predictions.shape[1], -1)
+    y_eval_flat = y_eval_np.reshape(y_eval_np.shape[0], -1)
+
+    if return_preds:
+        if flatten_output:
+            return predictions_flat, y_eval_flat
+        return predictions, y_eval_np
+
+    return uq_evaluation.compute_metric(predictions_flat, noise_std, y_eval_flat)
+
+
+def baseline(eval_indices, test_data, model):
+    """
+    Baseline deterministic RMSE using MAP model predictions.
+
+    `eval_indices` can be an index array (preferred) or an int (legacy API).
+    """
+    n_total = len(test_data["X_train"])
+    eval_indices = _resolve_eval_indices(eval_indices, n_total)
+
+    X_eval = _take_rows(test_data["X_train"], eval_indices)
+    y_eval = _take_rows(test_data["Y_train"], eval_indices)
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    X_test_tensor = _to_tensor_float(X_eval, device)
+
+    with torch.no_grad():
+        pred = model.predict(X_test_tensor).detach().cpu().numpy()
+
+    y_eval_np = _to_numpy(y_eval)
+    errors = y_eval_np.reshape(y_eval_np.shape[0], -1) - pred.reshape(pred.shape[0], -1)
+    rmse = np.sqrt(np.mean(errors ** 2))
+    return float(rmse)

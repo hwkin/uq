@@ -170,9 +170,9 @@ class PCANet(nn.Module):
             # check if we need to save model parameters
             if save_model == True and (epoch % save_epoch == 0 or epoch == epochs):
                 torch.save(self, self.save_file)
-                print('-'*50)
-                print('Model parameters saved at epoch {}'.format(epoch))
-                print('-'*50)
+                # print('-'*50)
+                # print('Model parameters saved at epoch {}'.format(epoch))
+                # print('-'*50)
 
         # print final message
         end_time = time.perf_counter()

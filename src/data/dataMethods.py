@@ -40,7 +40,11 @@ class DataProcessor:
                  num_inp_fn_points = 2601, num_out_fn_points = 2601, \
                  num_Y_components = 1, \
                  num_inp_red_dim = None, \
-                 num_out_red_dim = None):
+                 num_out_red_dim = None, \
+                 X_train_svd_projector = None, \
+                 X_train_s_values = None ,\
+                 Y_train_svd_projector = None, \
+                 Y_train_s_values = None):
         
         # load data from file
         self.data = np.load(data_file_name)
@@ -53,6 +57,10 @@ class DataProcessor:
         self.num_inp_red_dim = num_inp_red_dim
         self.num_out_red_dim = num_out_red_dim
         self.tol = 1.0e-9
+        self.X_train_svd_projector = X_train_svd_projector
+        self.X_train_s_values = X_train_s_values
+        self.Y_train_svd_projector = Y_train_svd_projector
+        self.Y_train_s_values = Y_train_s_values
 
         self.load_X_data(self.data)
         self.load_Y_data(self.data)
@@ -104,7 +112,8 @@ class DataProcessor:
 
         if self.num_inp_red_dim is not None:
             # compute SVD of input data 
-            self.X_train_svd_projector, self.X_train_s_values = self.compute_svd(self.X_train, self.num_inp_red_dim, is_data_centered = True)
+            if self.X_train_svd_projector is None or self.X_train_s_values is None:
+                self.X_train_svd_projector, self.X_train_s_values = self.compute_svd(self.X_train, self.num_inp_red_dim, is_data_centered = True)
 
             # define training and testing data in the reduced dimension
             self.X_train = np.dot(self.X_train, self.X_train_svd_projector.T)
@@ -130,7 +139,8 @@ class DataProcessor:
 
         if self.num_out_red_dim is not None:
             # compute SVD of output data 
-            self.Y_train_svd_projector, self.Y_train_s_values = self.compute_svd(self.Y_train, self.num_out_red_dim, is_data_centered = True)
+            if self.Y_train_svd_projector is None or self.Y_train_s_values is None:
+                self.Y_train_svd_projector, self.Y_train_s_values = self.compute_svd(self.Y_train, self.num_out_red_dim, is_data_centered = True)
 
             # define training and testing data in the reduced dimension
             self.Y_train = np.dot(self.Y_train, self.Y_train_svd_projector.T)

@@ -139,9 +139,9 @@ class DeepONet(nn.Module):
 
         self.trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         
-        print('-'*50)
-        print('Starting training with {} trainable parameters...'.format(self.trainable_params))
-        print('-'*50)
+        # print('-'*50)
+        # print('Starting training with {} trainable parameters...'.format(self.trainable_params))
+        # print('-'*50)
         
         for epoch in range(1, epochs+1):
 
@@ -200,19 +200,19 @@ class DeepONet(nn.Module):
             epoch_time = t2 - t1
 
             if log == True and (epoch % loss_print_freq == 0 or epoch == epochs or epoch == 1):
-                print('-'*50)
+                # print('-'*50)
                 print('Epoch: {:5d}, Train Loss (l2 squared): {:.3e}, Test Loss (l2 squared): {:.3e}, Time (sec): {:.3f}'.format(epoch, \
                                     np.mean(self.train_loss_log[epoch-1, 0]), \
                                     np.mean(self.test_loss_log[epoch-1, 0]), \
                                     epoch_time))
-                print('-'*50)
+                # print('-'*50)
 
             # check if we need to save model parameters
             if save_model == True and (epoch % save_epoch == 0 or epoch == epochs):
                 torch.save(self, self.save_file)
-                print('-'*50)
-                print('Model parameters saved at epoch {}'.format(epoch))
-                print('-'*50)
+                # print('-'*50)
+                # print('Model parameters saved at epoch {}'.format(epoch))
+                # print('-'*50)
 
         # print final message
         end_time = time.perf_counter()

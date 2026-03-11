@@ -24,3 +24,5 @@ dependencies:
     - pygmsh
     - pyvista[all,trame]
     - hamiltorch
+    - laplace-torch
+    - curvlinops-for-pytorch==2.0.0
