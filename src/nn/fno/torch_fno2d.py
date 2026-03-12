@@ -156,8 +156,11 @@ class FNO2D(nn.Module):
                 Y_train_pred = self.forward(X_train)
 
                 # compute and save loss
-                loss = criterion(Y_train_pred.view(batch_size, -1), \
-                                 Y_train.view(batch_size, -1)) 
+                batch_n = Y_train_pred.shape[0]
+                loss = criterion(
+                    Y_train_pred.reshape(batch_n, -1),
+                    Y_train.reshape(batch_n, -1),
+                )
                 train_losses.append(loss.item())
 
                 # backward pass
@@ -181,8 +184,11 @@ class FNO2D(nn.Module):
                     Y_test_pred = self.forward(X_test)
 
                     # compute and save test loss
-                    test_loss = criterion(Y_test_pred.view(batch_size, -1), \
-                                          Y_test.view(batch_size, -1))
+                    batch_n = Y_test_pred.shape[0]
+                    test_loss = criterion(
+                        Y_test_pred.reshape(batch_n, -1),
+                        Y_test.reshape(batch_n, -1),
+                    )
                     test_losses.append(test_loss.item())
 
             # log losses

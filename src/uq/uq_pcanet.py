@@ -899,8 +899,9 @@ def uqevaluation(
     elif method == "de":
         if model_ensemble is None:
             raise ValueError("model_ensemble must be provided for method='de'.")
+        draws = _subsample_draws(model_ensemble, max_posterior_samples)
         with torch.no_grad():
-            for path in model_ensemble:
+            for path in draws:
                 m = torch.load(path, weights_only=False).to(device)
                 pred = m.predict(x_tensor)
                 preds_eval_list.append(pred.detach().cpu().numpy())

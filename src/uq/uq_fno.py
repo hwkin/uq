@@ -522,11 +522,14 @@ def make_log_prob_fn(
                 indices = torch.randperm(N, device=device)[:batch_size]
                 X_batch = X[indices]
                 y_batch = y[indices]
+                batch_n = X_batch.shape[0]
+                if batch_n == 0:
+                    raise ValueError("Mini-batch size resolved to zero. Increase data size or batch_size.")
 
                 pred = _functional_forward_real_subset(model, flat_params, X_batch, meta)
-                resid = (y_batch - pred).reshape(batch_size, -1)
+                resid = (y_batch - pred).reshape(batch_n, -1)
                 resid2 = resid.pow(2).mean(dim=1).sum()
-                ll = -0.5 * (resid2 / (noise_std ** 2)) * (N / batch_size)
+                ll = -0.5 * (resid2 / (noise_std ** 2)) * (N / batch_n)
 
             return ll + lp
 
@@ -548,11 +551,14 @@ def make_log_prob_fn(
             indices = torch.randperm(N, device=device)[:batch_size]
             X_batch = X[indices]
             y_batch = y[indices]
+            batch_n = X_batch.shape[0]
+            if batch_n == 0:
+                raise ValueError("Mini-batch size resolved to zero. Increase data size or batch_size.")
 
             pred = _functional_forward(model, flat_params, X_batch)
-            resid = (y_batch - pred).reshape(batch_size, -1)
+            resid = (y_batch - pred).reshape(batch_n, -1)
             resid2 = resid.pow(2).mean(dim=1).sum()
-            ll = -0.5 * (resid2 / (noise_std**2)) * (N / batch_size)
+            ll = -0.5 * (resid2 / (noise_std**2)) * (N / batch_n)
 
         return ll + lp
 
@@ -1200,7 +1206,12 @@ def compute_diagonal_hessian(model, X, y, noise_std, prior_std, device,
     H_diag = torch.ones(n_params, device=device) / (prior_std ** 2)
     
     # Scale factor to account for subsampling output points
-    scale_factor = n_points / sample_points_per_batch
+    n_sample = min(sample_points_per_batch, n_points)
+    if n_sample <= 0:
+        raise ValueError(
+            f"Cannot sample from {n_points} points with sample_points_per_batch={sample_points_per_batch}"
+        )
+    scale_factor = n_points / n_sample
     noise_var_inv = 1.0 / (noise_std ** 2)
     
     # Process samples in batches
@@ -1209,9 +1220,6 @@ def compute_diagonal_hessian(model, X, y, noise_std, prior_std, device,
         X_batch = X_tensor[i:batch_end].to(device)
         
         # Sample output point indices (flattened)
-        n_sample = min(sample_points_per_batch, n_points)
-        if n_sample <= 0:
-            raise ValueError(f"Cannot sample from {n_points} points with sample_points_per_batch={sample_points_per_batch}")
         sample_indices = np.random.choice(n_points, n_sample, replace=False)
         
         # Forward pass - use forward() to enable gradient computation
@@ -1413,8 +1421,9 @@ def uqevaluation(
     elif method == 'de':
         if model_ensemble is None:
             raise ValueError("model_ensemble must be provided for method='de'.")
+        draws = _subsample_draws(model_ensemble, max_posterior_samples)
         with torch.no_grad():
-            for path in model_ensemble:
+            for path in draws:
                 m = torch.load(path, weights_only=False).to(device)
                 pred = m.predict(X_test_tensor).detach().cpu().numpy()
                 predictions.append(pred)

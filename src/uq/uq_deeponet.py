@@ -97,16 +97,19 @@ def make_minibatch_log_prob_fn(model, x_branch, x_trunk, y, batch_size=100, nois
         unpack_params(model, flat_params)
         
         # Sample mini-batch
-        idx = torch.randperm(N, device=device)[:batch_size]
+        idx = torch.randperm(N, device=device)[: min(batch_size, N)]
         x_b_batch = x_branch[idx]
         y_batch = y[idx]
+        batch_n = x_b_batch.shape[0]
+        if batch_n == 0:
+            raise ValueError("Mini-batch size resolved to zero. Increase data size or batch_size.")
         
         pred = model.forward(x_b_batch, x_trunk) # Use forward to keep gradients
-        resid = (y_batch - pred).reshape(batch_size, -1)
+        resid = (y_batch - pred).reshape(batch_n, -1)
         
         # Log-likelihood (Gaussian) - SCALED by N/batch_size
         sse = resid.pow(2).sum()
-        ll = -0.5 * (N / batch_size) * (sse / (noise_std**2))
+        ll = -0.5 * (N / batch_n) * (sse / (noise_std**2))
         
         # Log-prior (Gaussian) - NOT scaled (applied once to parameters)
         lp = -0.5 * (flat_params.pow(2).sum() / (prior_std**2))
@@ -1038,8 +1041,9 @@ def uqevaluation(
     elif method == 'de':
         if model_ensemble is None:
             raise ValueError("model_ensemble must be provided for method='de'.")
+        draws = _subsample_draws(model_ensemble, max_posterior_samples)
         with torch.no_grad():
-            for paths in model_ensemble:  # model is a list of paths for models.
+            for paths in draws:  # model is a list of paths for models.
                 m = torch.load(paths, weights_only=False).to(device)
                 pred = m.predict(x_b, x_t)
                 preds_eval_list.append(pred.cpu().numpy())
