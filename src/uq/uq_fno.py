@@ -151,6 +151,10 @@ _HMC_SUBSET_ALIASES = {
     "projectors": "projectors",
     "proj": "projectors",
     "head": "projectors",
+    "projector_biases": "projector_biases",
+    "proj_biases": "projector_biases",
+    "biases": "projector_biases",
+    "output_bias": "output_bias",
     "last_layer": "last_layer",
     "last-layer": "last_layer",
     "last": "last_layer",
@@ -180,7 +184,7 @@ def _normalize_hmc_subset_of_weights(subset_of_weights):
     if key not in _HMC_SUBSET_ALIASES:
         raise ValueError(
             f"Unsupported HMC subset_of_weights='{subset_of_weights}'. "
-            "Use one of: 'all', 'real_all', 'projectors', 'last_layer'."
+            "Use one of: 'all', 'real_all', 'projectors', 'projector_biases', 'output_bias', 'last_layer'."
         )
     return _HMC_SUBSET_ALIASES[key]
 
@@ -223,6 +227,25 @@ def _set_requires_grad_subset_fno(model, subset_key):
             p.requires_grad = True
         for p in model.output_projector.parameters():
             p.requires_grad = True
+        return "real_only"
+
+    if subset_key == "projector_biases":
+        if not hasattr(model, "input_projector") or not hasattr(model, "output_projector"):
+            raise AttributeError("FNO model is missing input/output projectors.")
+        if getattr(model.input_projector, "bias", None) is None:
+            raise AttributeError("FNO input_projector has no bias parameter.")
+        if getattr(model.output_projector, "bias", None) is None:
+            raise AttributeError("FNO output_projector has no bias parameter.")
+        model.input_projector.bias.requires_grad = True
+        model.output_projector.bias.requires_grad = True
+        return "real_only"
+
+    if subset_key == "output_bias":
+        if not hasattr(model, "output_projector"):
+            raise AttributeError("FNO model has no output_projector.")
+        if getattr(model.output_projector, "bias", None) is None:
+            raise AttributeError("FNO output_projector has no bias parameter.")
+        model.output_projector.bias.requires_grad = True
         return "real_only"
 
     if subset_key == "last_layer":
@@ -714,7 +737,8 @@ def fit_hmc_torch(
     Important note for FNO:
       - subset='all' samples all parameters, including complex Fourier weights
         represented via concatenated real/imag parts.
-      - subset in {'real_all', 'projectors', 'last_layer'} samples only a real-valued
+      - subset in {'real_all', 'projectors', 'projector_biases', 'output_bias', 'last_layer'}
+        samples only a real-valued
         subset and reconstructs full vectors with complex weights fixed at MAP values.
     """
     torch.manual_seed(random_seed)
@@ -798,6 +822,151 @@ def fit_hmc_torch(
                 base_state=base_state,
             )
         )
+    return torch.stack(full_samples, dim=0)
+
+
+def fit_hmc_lowrank_swag_torch(
+    model,
+    X,
+    y,
+    swag_state,
+    noise_std=0.2,
+    latent_prior_std=1.0,
+    rank=10,
+    initial_step_size=1e-3,
+    leapfrog_steps=5,
+    num_samples=1000,
+    burn_in=800,
+    random_seed=42,
+    reduce_output_mean=True,
+):
+    """
+    Run HMC in a low-rank SWAG subspace around the MAP weights.
+
+    This parameterization samples latent coordinates z where:
+        theta = theta_map + U z
+    with U built from SWAG low-rank covariance factors. This is often far more
+    stable than sampling directly in the full parameter space for FNO models.
+
+    Args:
+        model: Trained FNO model (MAP point).
+        X, y: Training subset used for the likelihood term.
+        swag_state: Dict returned by `fit_swag`, containing `cov_mat_sqrt`.
+        noise_std: Observation noise std in Gaussian likelihood.
+        latent_prior_std: Std of isotropic Gaussian prior on latent z.
+        rank: Number of SWAG directions used (<= available rank).
+        initial_step_size: HMC/NUTS step size.
+        leapfrog_steps: Number of leapfrog steps per sample.
+        num_samples: Total MCMC iterations (including burn handling by hamiltorch).
+        burn_in: Burn-in iterations.
+        random_seed: RNG seed.
+        reduce_output_mean: If True, use mean over spatial outputs per sample.
+
+    Returns:
+        Tensor of shape [num_retained_draws, n_full_params] on CPU.
+    """
+    torch.manual_seed(random_seed)
+    np.random.seed(random_seed)
+    hamiltorch.set_random_seed(random_seed)
+
+    noise_std = _coerce_positive_scalar(noise_std, "noise_std")
+    latent_prior_std = _coerce_positive_scalar(latent_prior_std, "latent_prior_std")
+
+    if not isinstance(swag_state, dict) or "cov_mat_sqrt" not in swag_state:
+        raise ValueError("swag_state must be a dict containing 'cov_mat_sqrt'.")
+
+    cov_mat_sqrt = swag_state["cov_mat_sqrt"]
+    if not torch.is_tensor(cov_mat_sqrt):
+        cov_mat_sqrt = torch.as_tensor(cov_mat_sqrt, dtype=torch.float32)
+    if cov_mat_sqrt.ndim != 2:
+        raise ValueError(
+            f"Expected swag_state['cov_mat_sqrt'] with shape [k, p], got {tuple(cov_mat_sqrt.shape)}."
+        )
+
+    available_rank = int(cov_mat_sqrt.shape[0])
+    if available_rank <= 0:
+        raise ValueError("SWAG low-rank covariance has zero rank; run fit_swag with snapshots first.")
+
+    use_rank = int(rank)
+    if use_rank <= 0:
+        raise ValueError(f"rank must be positive, got {use_rank}.")
+    use_rank = min(use_rank, available_rank)
+
+    device = next(model.parameters()).device
+    model_lr = copy.deepcopy(model).to(device)
+    # Ensure full-parameter functional forward uses all model weights.
+    for p in model_lr.parameters():
+        p.requires_grad = True
+
+    # MAP anchor in full flattened parameterization (complex-safe split).
+    theta_map = pack_params(model_lr).to(device)
+    param_dim = int(theta_map.numel())
+
+    # Build orthonormal low-rank basis U in full parameter space.
+    # cov_mat_sqrt is [k, p], so basis candidates are rows -> transpose to [p, k].
+    basis_raw = cov_mat_sqrt[:use_rank].to(device=device, dtype=theta_map.dtype).t().contiguous()
+    if basis_raw.shape[0] != param_dim:
+        raise ValueError(
+            f"SWAG basis dimension mismatch: basis has p={basis_raw.shape[0]}, model has p={param_dim}."
+        )
+    U, _ = torch.linalg.qr(basis_raw, mode="reduced")  # [p, r]
+
+    if isinstance(X, np.ndarray):
+        X_t = torch.from_numpy(X).float().to(device)
+    elif torch.is_tensor(X):
+        X_t = X.float().to(device)
+    else:
+        X_t = torch.as_tensor(X, dtype=torch.float32, device=device)
+
+    if isinstance(y, np.ndarray):
+        y_t = torch.from_numpy(y).float().to(device)
+    elif torch.is_tensor(y):
+        y_t = y.float().to(device)
+    else:
+        y_t = torch.as_tensor(y, dtype=torch.float32, device=device)
+
+    N = int(X_t.shape[0])
+    if N <= 0:
+        raise ValueError("X must contain at least one sample for low-rank HMC.")
+
+    def log_prob_z(z):
+        if z.ndim != 1:
+            z = z.reshape(-1)
+        if z.numel() != use_rank:
+            raise ValueError(f"Expected latent vector of size {use_rank}, got {z.numel()}.")
+
+        theta = theta_map + U @ z
+        pred = _functional_forward(model_lr, theta, X_t)
+        resid = (y_t - pred).reshape(N, -1)
+        if reduce_output_mean:
+            resid2 = resid.pow(2).mean(dim=1).sum()
+        else:
+            resid2 = resid.pow(2).sum()
+        ll = -0.5 * (resid2 / (noise_std ** 2))
+        lp = -0.5 * (z.pow(2).sum() / (latent_prior_std ** 2))
+        return ll + lp
+
+    z0 = torch.zeros(use_rank, device=device, dtype=theta_map.dtype).requires_grad_(True)
+    print(
+        "Preparing low-rank SWAG HMC: "
+        f"param_dim={param_dim}, available_rank={available_rank}, used_rank={use_rank}, "
+        f"noise_std={noise_std:.3e}, latent_prior_std={latent_prior_std:.3e}"
+    )
+    sampled_z_list = hamiltorch.sample(
+        log_prob_func=log_prob_z,
+        params_init=z0,
+        num_samples=num_samples,
+        burn=burn_in,
+        step_size=initial_step_size,
+        num_steps_per_sample=leapfrog_steps,
+        sampler=hamiltorch.Sampler.HMC_NUTS,
+    )
+
+    sampled_z = torch.stack(sampled_z_list, dim=0)
+    full_samples = []
+    for z in sampled_z:
+        theta = theta_map + U @ z.to(device)
+        full_samples.append(theta.detach().cpu())
     return torch.stack(full_samples, dim=0)
 
 
